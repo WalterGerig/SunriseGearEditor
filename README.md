@@ -2,6 +2,10 @@
 
 An unofficial Gear Editor for Sunrise that allows weapons and armor to be edited live while the game is running.
 
+## Bug Reporting
+
+If you encounter any bugs or game crashes Please open a Issue in this github repo and try to explain how the bug happend or the game crashed
+
 ## Features
 
 ### Weapons

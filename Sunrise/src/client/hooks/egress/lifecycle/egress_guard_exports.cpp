@@ -1,0 +1,131 @@
+#include <string_view>
+
+#include "../../../../core/runtime/host_environment.h"
+#include "../dns/egress_dns_replacements.h"
+#include "../extensions/egress_extension_replacements.h"
+#include "../resolver/replacements.h"
+#include "../winsock/replacements.h"
+#include "internal.h"
+
+namespace sunrise::client::hooks::egress::lifecycle {
+namespace {
+
+struct ExportDefinition {
+    ModuleSlot module{};
+    const char* name{};
+    void* replacement{};
+};
+
+template <typename Function>
+[[nodiscard]] ExportDefinition
+export_definition(ModuleSlot module, const char* name, Function replacement) noexcept {
+    return ExportDefinition{module, name, reinterpret_cast<void*>(replacement)};
+}
+
+/** Winsock's own generic failure code, which a refused connection call answers with. */
+constexpr int kSocketError = -1;
+/** WSAHOST_NOT_FOUND. A refused name lookup answers with it, so nothing resolves an address. */
+constexpr int kHostNotFound = 11001;
+
+/**
+ * Stands in for one export Wine does not provide, so the guard still owns the call.
+ * Detours copies at least five bytes from a target, so the body must not fold away to a bare
+ * return. The volatile store is what keeps it long enough to detour.
+ * @return The refusal the real export would answer with.
+ */
+__declspec(noinline) int WSAAPI absent_connect_by_list() noexcept {
+    volatile int occupied = 0;
+    occupied += 1;
+    return kSocketError;
+}
+
+/** @return The refusal the real export would answer with. See absent_connect_by_list. */
+__declspec(noinline) int WSAAPI absent_address_info_ex_a() noexcept {
+    volatile int occupied = 0;
+    occupied += 1;
+    return kHostNotFound;
+}
+
+} // namespace
+
+/** Finds the whole Windows SDK egress surface for one atomic Detours batch. */
+bool resolve_specs(std::span<hooking::detour::Spec, kHookCount> specs,
+                   std::span<const char*, kHookCount> names,
+                   std::span<bool, kHookCount> resolved,
+                   std::size_t& count) noexcept {
+    count = 0;
+    const bool underWine = core::runtime::is_wine();
+
+    const std::array<ExportDefinition, kHookCount> exports{
+        export_definition(ModuleSlot::winsock, "connect", &winsock::connection::connect_socket),
+        export_definition(
+            ModuleSlot::winsock, "WSAConnect", &winsock::connection::connect_socket_ex),
+        export_definition(
+            ModuleSlot::winsock, "WSAConnectByNameA", &winsock::connection::connect_by_name_a),
+        export_definition(
+            ModuleSlot::winsock, "WSAConnectByNameW", &winsock::connection::connect_by_name_w),
+        export_definition(
+            ModuleSlot::winsock, "WSAConnectByList", &winsock::connection::connect_by_list),
+        export_definition(ModuleSlot::winsock, "send", &winsock::transmission::send_bytes),
+        export_definition(ModuleSlot::winsock, "WSASend", &winsock::transmission::send_buffers),
+        export_definition(ModuleSlot::winsock, "sendto", &winsock::transmission::send_bytes_to),
+        export_definition(
+            ModuleSlot::winsock, "WSASendTo", &winsock::transmission::send_buffers_to),
+        export_definition(ModuleSlot::winsock, "WSASendMsg", &winsock::transmission::send_message),
+        export_definition(
+            ModuleSlot::winsock, "WSASendDisconnect", &winsock::transmission::send_disconnect),
+        export_definition(ModuleSlot::winsock, "WSAJoinLeaf", &winsock::connection::join_leaf),
+        export_definition(ModuleSlot::extensions, "TransmitFile", &extensions::transmit_file),
+        export_definition(ModuleSlot::winsock, "WSAIoctl", &winsock::control::socket_control),
+        export_definition(ModuleSlot::winsock, "getaddrinfo", &resolver::address_info_a),
+        export_definition(ModuleSlot::winsock, "GetAddrInfoW", &resolver::address_info_w),
+        export_definition(ModuleSlot::winsock, "GetAddrInfoExA", &resolver::address_info_ex_a),
+        export_definition(ModuleSlot::winsock, "GetAddrInfoExW", &resolver::address_info_ex_w),
+        export_definition(ModuleSlot::winsock, "gethostbyname", &resolver::host_by_name),
+        export_definition(ModuleSlot::winsock, "gethostbyaddr", &resolver::host_by_address),
+        export_definition(ModuleSlot::winsock, "getnameinfo", &resolver::name_info_a),
+        export_definition(ModuleSlot::winsock, "GetNameInfoW", &resolver::name_info_w),
+        export_definition(ModuleSlot::dns, "DnsQuery_A", &dns::query_a),
+        export_definition(ModuleSlot::dns, "DnsQuery_W", &dns::query_w),
+        export_definition(ModuleSlot::dns, "DnsQuery_UTF8", &dns::query_utf8),
+        export_definition(ModuleSlot::dns, "DnsQueryEx", &dns::query_ex),
+        export_definition(ModuleSlot::winsock, "recv", &winsock::reception::receive_bytes),
+        export_definition(ModuleSlot::winsock, "WSARecv", &winsock::reception::receive_buffers),
+        export_definition(ModuleSlot::winsock, "recvfrom", &winsock::reception::receive_bytes_from),
+        export_definition(
+            ModuleSlot::winsock, "WSARecvFrom", &winsock::reception::receive_buffers_from),
+        export_definition(ModuleSlot::dns, "DnsQueryRaw", &dns::query_raw),
+    };
+
+    for (std::size_t index = 0; index < exports.size(); ++index) {
+        const ExportDefinition& definition = exports[index];
+        const HMODULE module = module_handle(definition.module);
+        void* target = reinterpret_cast<void*>(GetProcAddress(module, definition.name));
+        names[index] = definition.name;
+
+        // Wine does not export every name Windows does. A missing one still needs a target, or
+        // the guard would leave that call unowned.
+        if (target == nullptr && underWine) {
+            const std::string_view exportName(definition.name);
+            if (exportName == "WSAConnectByList") {
+                target = reinterpret_cast<void*>(&absent_connect_by_list);
+            } else if (exportName == "GetAddrInfoExA") {
+                target = reinterpret_cast<void*>(&absent_address_info_ex_a);
+            }
+        }
+
+        resolved[index] = target != nullptr;
+
+        if (target == nullptr) {
+            if (index < kRequiredHookCount) {
+                return false;
+            }
+            continue;
+        }
+        specs[count] = hooking::detour::Spec{target, definition.replacement};
+        count = index + 1;
+    }
+    return count >= kRequiredHookCount;
+}
+
+} // namespace sunrise::client::hooks::egress::lifecycle

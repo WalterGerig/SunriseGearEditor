@@ -1,0 +1,15 @@
+/.vs/
+/.idea/
+/.vscode/
+/.direnv/
+/.xwin-cache/
+/.cache/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.aps
+*.log
+
+# CMake build files
+/build/

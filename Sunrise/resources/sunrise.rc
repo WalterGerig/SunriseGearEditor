@@ -1,0 +1,40 @@
+#include <winresrc.h>
+
+#include "resource.h"
+
+IDR_DEFAULT_SETTINGS RCDATA "default_settings.json"
+IDR_IMGUI_LICENSE RCDATA "../vendor/imgui/LICENSE.txt"
+IDR_DETOURS_LICENSE RCDATA "../vendor/detours/LICENSE.md"
+IDR_LOGO_SHEET RCDATA "logo_sheet.png"
+IDR_ITEM_NAMES RCDATA "item_names.bin"
+IDR_ITEM_ICONS RCDATA "item_icons.pack"
+IDR_ITEM_RARITY RCDATA "item_rarity.bin"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION SUNRISE_VER_MAJOR, SUNRISE_VER_MINOR, SUNRISE_VER_PATCH, SUNRISE_VER_BUILD
+PRODUCTVERSION SUNRISE_VER_MAJOR, SUNRISE_VER_MINOR, SUNRISE_VER_PATCH, SUNRISE_VER_BUILD
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 is US English and 04B0 is UTF-16, which is the pair the VarFileInfo block declares.
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Sunrise"
+            VALUE "FileVersion", SUNRISE_VER_STRING
+            VALUE "InternalName", "Sunrise"
+            // The shipped file carries the name the game delay-imports, not the module's own.
+            VALUE "OriginalFilename", "steam_api64.dll"
+            VALUE "ProductName", "Sunrise"
+            VALUE "ProductVersion", SUNRISE_VER_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

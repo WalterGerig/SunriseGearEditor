@@ -15,7 +15,7 @@ void draw() noexcept {
 
     ImGui::TextUnformatted("Infinite Ammo");
     ImGui::Separator();
-    ImGui::TextWrapped("Keep every weapon's reserves full.");
+    ImGui::TextWrapped("Keep every weapon's magazine and reserves full.");
     ImGui::Spacing();
 
     const bool changed = core::ui::components::toggle::control("Enabled##infinite_ammo",

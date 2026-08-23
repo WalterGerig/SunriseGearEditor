@@ -2,6 +2,8 @@
 
 #include "server/bap/runtime.h"
 
+#include "middleware/crypto/random_bytes.h"
+
 #include "core/filesystem/path.h"
 
 #include "core/ui/toast/ui_toast_runtime.h"
@@ -231,6 +233,28 @@ enum class EditorPage : std::uint8_t {
 
     armor,
 
+    randomizer,
+
+};
+
+enum class RandomizerTarget : std::uint8_t {
+
+    weapons,
+
+    armor,
+
+    both,
+
+};
+
+enum class RandomizerPerkMode : std::uint8_t {
+
+    normal,
+
+    fullyRandom,
+
+    exoticOnly,
+
 };
 
 enum class SocketKind : std::uint8_t {
@@ -266,6 +290,12 @@ std::array<std::size_t, 5> g_selectedArmorBySlot{};
 std::size_t g_activeArmorSlot{};
 
 EditorPage g_editorPage{EditorPage::weapons};
+
+RandomizerTarget g_randomizerTarget{RandomizerTarget::both};
+
+RandomizerPerkMode g_randomizerPerkMode{RandomizerPerkMode::normal};
+
+std::array<char, 224> g_randomizerMessage{};
 
 std::vector<PlugChoice> g_plugs{};
 
@@ -963,7 +993,13 @@ void rebuild_armor(const state::CharacterState& character) {
 
 [[nodiscard]] WeaponRow* selected_item() noexcept {
 
-    return g_editorPage == EditorPage::weapons ? selected_weapon() : selected_armor();
+    if (g_editorPage == EditorPage::weapons) {
+
+        return selected_weapon();
+
+    }
+
+    return g_editorPage == EditorPage::armor ? selected_armor() : nullptr;
 
 }
 
@@ -975,7 +1011,13 @@ void rebuild_armor(const state::CharacterState& character) {
 
     }
 
-    return g_activeArmorSlot < kArmorSlotNames.size() ? kArmorSlotNames[g_activeArmorSlot] : "ARMOR";
+    if (g_editorPage == EditorPage::armor) {
+
+        return g_activeArmorSlot < kArmorSlotNames.size() ? kArmorSlotNames[g_activeArmorSlot] : "ARMOR";
+
+    }
+
+    return "RANDOMIZER";
 
 }
 
@@ -1267,6 +1309,32 @@ void stage_plug(const WeaponRow& weapon,
 
 }
 
+[[nodiscard]] bool is_armor_detail(const item_details::Definition& detail) noexcept {
+
+    if (!detail.equipmentSlot.has_value()) {
+
+        return false;
+
+    }
+
+    switch (*detail.equipmentSlot) {
+
+        case 1:
+
+        case 2:
+
+        case 4:
+
+        case 5:
+
+        case 6: return true;
+
+        default: return false;
+
+    }
+
+}
+
 [[nodiscard]] bool is_exotic_weapon_detail(const item_details::Definition& detail) noexcept {
 
     if (!is_weapon_detail(detail)) {
@@ -1295,6 +1363,44 @@ void stage_plug(const WeaponRow& weapon,
 
 }
 
+[[nodiscard]] bool armor_matches_character_class(
+    const item_details::Definition& detail,
+    state::CharacterClass characterClass) noexcept {
+
+    if (!is_armor_detail(detail)) {
+
+        return true;
+
+    }
+
+    bool hasClassSpecificArt = false;
+
+    for (std::size_t slot = 1; slot < detail.artArrangementIndices.size(); ++slot) {
+
+        if (detail.artArrangementIndices[slot] != item_details::kUnavailableArtIndex) {
+
+            hasClassSpecificArt = true;
+
+            break;
+
+        }
+
+    }
+
+    if (!hasClassSpecificArt) {
+
+        // Some generic/universal armor only publishes the generic arrangement.
+        return true;
+
+    }
+
+    const std::size_t classSlot = static_cast<std::size_t>(characterClass) + 1U;
+
+    return classSlot < detail.artArrangementIndices.size()
+           && detail.artArrangementIndices[classSlot] != item_details::kUnavailableArtIndex;
+
+}
+
 [[nodiscard]] PlugCategoryMask category_for_socket(const item_details::Definition& detail,
 
                                                     std::uint8_t lane) noexcept {
@@ -1319,6 +1425,15 @@ void stage_plug(const WeaponRow& weapon,
 
     }
 
+    // Native socket type 677 is the armor intrinsic lane. It is the exact lane that carries
+    // Exotic armor perks, and is much more precise than treating every armor perk-like socket
+    // as Exotic.
+    if (!weapon && is_armor_detail(detail) && type == 677) {
+
+        return kPlugCategoryArmorExoticPerk;
+
+    }
+
     switch (socket_kind(detail, lane)) {
 
         case SocketKind::shader: return kPlugCategoryShader;
@@ -1333,7 +1448,22 @@ void stage_plug(const WeaponRow& weapon,
 
         case SocketKind::tracker: return kPlugCategoryTracker;
 
-        case SocketKind::perk: return weapon ? kPlugCategoryWeaponPerk : kPlugCategoryArmorMod;
+        case SocketKind::perk:
+            if (weapon) {
+
+                return kPlugCategoryWeaponPerk;
+
+            }
+
+            if (is_armor_detail(detail)) {
+
+                // Armor intrinsic lane 677 was handled above. Other perk-like armor lanes are
+                // ordinary armor choices/mods and must not pollute the Exotic Perks filter.
+                return kPlugCategoryArmorMod;
+
+            }
+
+            return kPlugCategoryNone;
 
         default: return kPlugCategoryNone;
 
@@ -1438,6 +1568,12 @@ void rebuild_plug_categories() {
         if ((categories & kPlugCategoryExoticIntrinsic) != 0) {
 
             categories &= static_cast<PlugCategoryMask>(~kPlugCategoryIntrinsic);
+
+        }
+
+        if ((categories & kPlugCategoryArmorExoticPerk) != 0) {
+
+            categories &= static_cast<PlugCategoryMask>(~kPlugCategoryArmorMod);
 
         }
 
@@ -4580,6 +4716,1302 @@ void draw_weapon_browser(WeaponRow& weapon) noexcept {
 
 }
 
+
+struct RandomizerRng {
+
+    std::uint64_t state{};
+
+    [[nodiscard]] bool initialize() noexcept {
+
+        std::array<std::byte, sizeof(std::uint64_t)> seed{};
+
+        if (!middleware::crypto::random::fill(seed)) {
+
+            return false;
+
+        }
+
+        std::memcpy(&state, seed.data(), sizeof(state));
+
+        if (state == 0) {
+
+            state = 0x9E3779B97F4A7C15ULL;
+
+        }
+
+        return true;
+
+    }
+
+    [[nodiscard]] std::uint64_t next() noexcept {
+
+        state ^= state >> 12U;
+
+        state ^= state << 25U;
+
+        state ^= state >> 27U;
+
+        return state * 2685821657736338717ULL;
+
+    }
+
+    [[nodiscard]] std::size_t index(std::size_t count) noexcept {
+
+        return count == 0 ? 0 : static_cast<std::size_t>(next() % count);
+
+    }
+
+};
+
+struct RandomizerItem {
+
+    inventory::Item item{};
+
+    state::build_data::items::Definition definition{};
+
+    item_details::Definition detail{};
+
+    bool weapon{};
+
+};
+
+struct RandomizerReplacementPool {
+
+    std::uint8_t bucketId{};
+
+    std::optional<std::int8_t> equipmentSlot{};
+
+    std::optional<state::CharacterClass> armorClass{};
+
+    std::vector<WeaponChoice> choices{};
+
+};
+
+struct RandomizerSocketCatalog {
+
+    std::vector<socket_plugs::Rule> rules =
+        std::vector<socket_plugs::Rule>(socket_plugs::kRuleCapacity);
+
+    std::vector<socket_plugs::Pool> pools =
+        std::vector<socket_plugs::Pool>(socket_plugs::kPoolCapacity);
+
+    std::vector<socket_plugs::Member> members =
+        std::vector<socket_plugs::Member>(socket_plugs::kMemberCapacity);
+
+    std::size_t ruleCount{};
+
+    std::size_t poolCount{};
+
+    std::size_t memberCount{};
+
+    std::vector<socket_plugs::Member> chaoticPerks{};
+
+    std::vector<socket_plugs::Member> weaponExoticPerks{};
+
+    std::vector<socket_plugs::Member> armorExoticPerks{};
+
+};
+
+[[nodiscard]] bool randomizer_wants_weapons(RandomizerTarget target) noexcept {
+
+    return target == RandomizerTarget::weapons || target == RandomizerTarget::both;
+
+}
+
+[[nodiscard]] bool randomizer_wants_armor(RandomizerTarget target) noexcept {
+
+    return target == RandomizerTarget::armor || target == RandomizerTarget::both;
+
+}
+
+void append_randomizer_item(std::vector<RandomizerItem>& items,
+
+                            const inventory::Item& item,
+
+                            bool weapon) {
+
+    if (std::any_of(items.begin(), items.end(), [&](const RandomizerItem& candidate) {
+
+            return same_instance(candidate.item, item);
+
+        })) {
+
+        return;
+
+    }
+
+    RandomizerItem target{};
+
+    if (!resolve_item(item, target.definition, target.detail)) {
+
+        return;
+
+    }
+
+    target.item = item;
+
+    target.weapon = weapon;
+
+    items.push_back(target);
+
+}
+
+[[nodiscard]] std::vector<RandomizerItem>
+
+collect_randomizer_items(const state::CharacterState& character, RandomizerTarget target) {
+
+    std::vector<RandomizerItem> items{};
+
+    items.reserve(character.inventory.count + kWeaponSlots.size() + kArmorSlots.size());
+
+    if (randomizer_wants_weapons(target)) {
+
+        for (const inventory::EquipmentSlot slot : kWeaponSlots) {
+
+            const std::size_t semantic = static_cast<std::size_t>(slot);
+
+            if (semantic < character.equipment.slots.size()
+
+                && character.equipment.slots[semantic].has_value()) {
+
+                append_randomizer_item(items, *character.equipment.slots[semantic], true);
+
+            }
+
+        }
+
+    }
+
+    if (randomizer_wants_armor(target)) {
+
+        for (const inventory::EquipmentSlot slot : kArmorSlots) {
+
+            const std::size_t semantic = static_cast<std::size_t>(slot);
+
+            if (semantic < character.equipment.slots.size()
+
+                && character.equipment.slots[semantic].has_value()) {
+
+                append_randomizer_item(items, *character.equipment.slots[semantic], false);
+
+            }
+
+        }
+
+    }
+
+    for (std::size_t index = 0; index < character.inventory.count; ++index) {
+
+        const inventory::Item& item = character.inventory.values[index];
+
+        state::build_data::items::Definition definition{};
+
+        item_details::Definition detail{};
+
+        if (!resolve_item(item, definition, detail)) {
+
+            continue;
+
+        }
+
+        if (randomizer_wants_weapons(target) && is_weapon_detail(detail)) {
+
+            append_randomizer_item(items, item, true);
+
+        } else if (randomizer_wants_armor(target) && is_armor_detail(detail)) {
+
+            append_randomizer_item(items, item, false);
+
+        }
+
+    }
+
+    return items;
+
+}
+
+[[nodiscard]] RandomizerReplacementPool&
+
+randomizer_replacement_pool(const RandomizerItem& item,
+
+                            std::vector<RandomizerReplacementPool>& pools,
+
+                            std::optional<state::CharacterClass> armorClass = std::nullopt) {
+
+    if (item.weapon) {
+
+        armorClass.reset();
+
+    }
+
+    for (RandomizerReplacementPool& pool : pools) {
+
+        if (pool.bucketId == item.definition.bucketId
+
+            && pool.equipmentSlot == item.detail.equipmentSlot
+
+            && pool.armorClass == armorClass) {
+
+            return pool;
+
+        }
+
+    }
+
+    RandomizerReplacementPool pool{};
+
+    pool.bucketId = item.definition.bucketId;
+
+    pool.equipmentSlot = item.detail.equipmentSlot;
+
+    pool.armorClass = armorClass;
+
+    const std::size_t definitionCount = state::build_data::item_definition_count();
+
+    for (std::size_t index = 0; index < definitionCount && index <= 0xFFFFU; ++index) {
+
+        state::build_data::items::Definition definition{};
+
+        item_details::Definition detail{};
+
+        if (!state::build_data::find_item_definition_index(static_cast<std::uint16_t>(index),
+
+                                                           definition)
+
+            || definition.definitionHash == inventory::kNoDefinitionHash
+
+            || definition.bucketId != pool.bucketId
+
+            || !state::build_data::find_configured_item_detail(definition.definitionIndex, detail)
+
+            || detail.bucketId != definition.bucketId
+
+            || detail.equipmentSlot != pool.equipmentSlot
+
+            || detail.instancedDefinitionState != item_details::InstancedDefinitionState::instanced
+
+            || detail.ordinarySocketState != item_details::OrdinarySocketState::present
+
+            || detail.ordinarySocketCount == 0
+
+            || detail.ordinarySocketCount > inventory::kPlugCapacity) {
+
+            continue;
+
+        }
+
+        if (armorClass.has_value() && is_armor_detail(detail)
+            && !armor_matches_character_class(detail, *armorClass)) {
+
+            continue;
+
+        }
+
+        const std::string_view name = display_name(definition.definitionHash);
+
+        if (name.empty()) {
+
+            continue;
+
+        }
+
+        WeaponRarity rarity = weapon_rarity(definition.definitionHash);
+
+        if (rarity == WeaponRarity::unknown && is_exotic_weapon_detail(detail)) {
+
+            rarity = WeaponRarity::exotic;
+
+        }
+
+        pool.choices.push_back(WeaponChoice{definition, detail, name, rarity});
+
+    }
+
+    pools.push_back(std::move(pool));
+
+    return pools.back();
+
+}
+
+[[nodiscard]] const WeaponChoice*
+
+choose_random_replacement(const RandomizerReplacementPool& pool,
+
+                          std::uint32_t currentHash,
+
+                          RandomizerRng& rng) noexcept {
+
+    if (pool.choices.empty()) {
+
+        return nullptr;
+
+    }
+
+    const std::size_t start = rng.index(pool.choices.size());
+
+    for (std::size_t offset = 0; offset < pool.choices.size(); ++offset) {
+
+        const WeaponChoice& choice = pool.choices[(start + offset) % pool.choices.size()];
+
+        if (choice.definition.definitionHash != currentHash) {
+
+            return &choice;
+
+        }
+
+    }
+
+    return nullptr;
+
+}
+
+[[nodiscard]] bool load_randomizer_socket_catalog(RandomizerSocketCatalog& catalog) {
+
+    if (!socket_plugs::snapshot(catalog.rules,
+
+                                catalog.ruleCount,
+
+                                catalog.pools,
+
+                                catalog.poolCount,
+
+                                catalog.members,
+
+                                catalog.memberCount)) {
+
+        return false;
+
+    }
+
+    catalog.rules.resize(catalog.ruleCount);
+
+    catalog.pools.resize(catalog.poolCount);
+
+    catalog.members.resize(catalog.memberCount);
+
+    rebuild_plug_categories();
+
+    constexpr PlugCategoryMask kChaoticPerkCategories =
+
+        kPlugCategoryWeaponPerk | kPlugCategoryIntrinsic | kPlugCategoryExoticIntrinsic
+
+        | kPlugCategoryMod | kPlugCategoryCatalyst | kPlugCategoryArmorMod
+
+        | kPlugCategoryArmorExoticPerk;
+
+    const auto append_unique_member = [](std::vector<socket_plugs::Member>& output,
+                                         socket_plugs::Member member) {
+
+        if (std::find(output.begin(), output.end(), member) == output.end()) {
+
+            output.push_back(member);
+
+        }
+
+    };
+
+    // Build the Exotic pools from their native intrinsic socket rules. Weapon intrinsic 176 and
+    // armor intrinsic 677 stay separate, so armor can never receive the weapon-only Exotic pool.
+    for (const socket_plugs::Rule& rule : catalog.rules) {
+
+        if (rule.poolIndex >= catalog.pools.size()) {
+
+            continue;
+
+        }
+
+        item_details::Definition hostDetail{};
+
+        if (!state::build_data::find_configured_item_detail(rule.itemDefinitionIndex, hostDetail)
+            || rule.lane >= hostDetail.ordinarySocketCount) {
+
+            continue;
+
+        }
+
+        const bool exoticWeaponLane =
+            is_exotic_weapon_detail(hostDetail)
+            && (category_for_socket(hostDetail, rule.lane) & kPlugCategoryExoticIntrinsic) != 0;
+
+        const bool exoticArmorLane =
+            is_armor_detail(hostDetail) && hostDetail.socketTypes[rule.lane] == 677;
+
+        if (!exoticWeaponLane && !exoticArmorLane) {
+
+            continue;
+
+        }
+
+        const socket_plugs::Pool& pool = catalog.pools[rule.poolIndex];
+        const std::size_t first = static_cast<std::size_t>(pool.memberOffset);
+        const std::size_t count = static_cast<std::size_t>(pool.memberCount);
+
+        if (first > catalog.members.size() || count > catalog.members.size() - first) {
+
+            continue;
+
+        }
+
+        for (std::size_t memberIndex = first; memberIndex < first + count; ++memberIndex) {
+
+            if (exoticWeaponLane) {
+
+                append_unique_member(catalog.weaponExoticPerks, catalog.members[memberIndex]);
+
+            }
+
+            if (exoticArmorLane) {
+
+                append_unique_member(catalog.armorExoticPerks, catalog.members[memberIndex]);
+
+            }
+
+        }
+
+    }
+
+    const std::size_t definitionCount = state::build_data::item_definition_count();
+
+    for (std::size_t index = 0;
+
+         index < definitionCount && index < g_plugCategoryByDefinition.size()
+
+         && index <= 0xFFFFU;
+
+         ++index) {
+
+        const auto definitionIndex = static_cast<std::uint16_t>(index);
+
+        if (!socket_plugs::contains(definitionIndex)) {
+
+            continue;
+
+        }
+
+        const PlugCategoryMask categories = g_plugCategoryByDefinition[index];
+
+        if ((categories & kChaoticPerkCategories) != 0) {
+
+            catalog.chaoticPerks.push_back(definitionIndex);
+
+        }
+
+        // Exotic pools are collected from their actual Exotic host-item socket rules above.
+
+    }
+
+    return true;
+
+}
+
+[[nodiscard]] std::span<const socket_plugs::Member>
+
+compatible_randomizer_members(const RandomizerSocketCatalog& catalog,
+
+                              std::uint16_t itemDefinitionIndex,
+
+                              std::uint8_t lane) noexcept {
+
+    const socket_plugs::Rule key{itemDefinitionIndex, lane, 0, 0};
+
+    const auto less = [](const socket_plugs::Rule& left, const socket_plugs::Rule& right) noexcept {
+
+        return left.itemDefinitionIndex < right.itemDefinitionIndex
+
+            || (left.itemDefinitionIndex == right.itemDefinitionIndex && left.lane < right.lane);
+
+    };
+
+    const auto found = std::lower_bound(catalog.rules.begin(), catalog.rules.end(), key, less);
+
+    if (found == catalog.rules.end() || found->itemDefinitionIndex != itemDefinitionIndex
+
+        || found->lane != lane || found->poolIndex >= catalog.pools.size()) {
+
+        return {};
+
+    }
+
+    const socket_plugs::Pool& pool = catalog.pools[found->poolIndex];
+
+    const std::size_t first = static_cast<std::size_t>(pool.memberOffset);
+
+    const std::size_t count = static_cast<std::size_t>(pool.memberCount);
+
+    if (first > catalog.members.size() || count > catalog.members.size() - first) {
+
+        return {};
+
+    }
+
+    return std::span<const socket_plugs::Member>{catalog.members.data() + first, count};
+
+}
+
+[[nodiscard]] std::optional<socket_plugs::Member>
+
+choose_random_member(std::span<const socket_plugs::Member> members,
+
+                     std::optional<socket_plugs::Member> current,
+
+                     RandomizerRng& rng) noexcept {
+
+    if (members.empty()) {
+
+        return std::nullopt;
+
+    }
+
+    const std::size_t start = rng.index(members.size());
+
+    for (std::size_t offset = 0; offset < members.size(); ++offset) {
+
+        const socket_plugs::Member candidate = members[(start + offset) % members.size()];
+
+        if (!current.has_value() || candidate != *current) {
+
+            return candidate;
+
+        }
+
+    }
+
+    return std::nullopt;
+
+}
+
+[[nodiscard]] bool randomizer_perk_lane(const item_details::Definition& detail,
+
+                                        std::uint8_t lane) noexcept {
+
+    if (socket_kind(detail, lane) == SocketKind::perk) {
+
+        return true;
+
+    }
+
+    const PlugCategoryMask categories = category_for_socket(detail, lane);
+
+    return (categories & (kPlugCategoryWeaponPerk | kPlugCategoryIntrinsic
+
+                          | kPlugCategoryExoticIntrinsic | kPlugCategoryArmorMod
+
+                          | kPlugCategoryArmorExoticPerk))
+
+        != 0;
+
+}
+
+[[nodiscard]] std::optional<socket_plugs::Member>
+
+current_randomizer_plug(const RandomizerItem& item,
+
+                        const item_details::Definition& detail,
+
+                        std::uint8_t lane,
+
+                        bool replaced) noexcept {
+
+    if (lane >= detail.ordinarySocketCount) {
+
+        return std::nullopt;
+
+    }
+
+    if (!replaced && item.item.sockets.policy == inventory::SocketPolicy::authored
+
+        && lane < item.item.sockets.plugCount && item.item.sockets.plugs[lane].has_value()) {
+
+        state::build_data::items::Definition definition{};
+
+        if (state::build_data::find_item_definition_hash(*item.item.sockets.plugs[lane],
+
+                                                         definition)) {
+
+            return definition.definitionIndex;
+
+        }
+
+    }
+
+    const std::uint16_t initial = detail.initialPlugIndices[lane];
+
+    if (initial == item_details::kUnavailableItemIndex) {
+
+        return std::nullopt;
+
+    }
+
+    return initial;
+
+}
+
+constexpr std::size_t kRandomizerUnequippedItemsPerSlot = 9;
+
+[[nodiscard]] bool randomizer_equipped_template(const state::CharacterState& character,
+                                                inventory::EquipmentSlot slot,
+                                                RandomizerItem& output) {
+
+    const std::size_t semantic = static_cast<std::size_t>(slot);
+
+    if (semantic >= character.equipment.slots.size()
+        || !character.equipment.slots[semantic].has_value()) {
+
+        return false;
+
+    }
+
+    const inventory::Item& item = *character.equipment.slots[semantic];
+
+    if (!resolve_item(item, output.definition, output.detail)) {
+
+        return false;
+
+    }
+
+    output.item = item;
+
+    output.weapon = is_weapon_detail(output.detail);
+
+    return true;
+
+}
+
+[[nodiscard]] std::size_t randomizer_inventory_count_for_slot(
+    const state::CharacterState& character,
+    const RandomizerItem& slotTemplate) {
+
+    std::size_t count = 0;
+
+    for (std::size_t index = 0; index < character.inventory.count; ++index) {
+
+        state::build_data::items::Definition definition{};
+
+        item_details::Definition detail{};
+
+        if (!resolve_item(character.inventory.values[index], definition, detail)) {
+
+            continue;
+
+        }
+
+        if (definition.bucketId == slotTemplate.definition.bucketId
+            && detail.equipmentSlot == slotTemplate.detail.equipmentSlot) {
+
+            ++count;
+
+        }
+
+    }
+
+    return count;
+
+}
+
+struct RandomizerResult {
+
+    std::size_t targetItems{};
+
+    std::size_t insertedItems{};
+
+    std::size_t replacedItems{};
+
+    std::size_t randomizedSockets{};
+
+    std::size_t skippedSockets{};
+
+    std::size_t failures{};
+
+};
+
+void fill_randomizer_slot(const state::CharacterState& character,
+                          inventory::EquipmentSlot slot,
+                          state::CharacterClass characterClass,
+                          RandomizerRng& rng,
+                          std::vector<RandomizerReplacementPool>& replacementPools,
+                          RandomizerResult& result) {
+
+    RandomizerItem slotTemplate{};
+
+    if (!randomizer_equipped_template(character, slot, slotTemplate)) {
+
+        ++result.failures;
+
+        return;
+
+    }
+
+    const std::size_t existing = randomizer_inventory_count_for_slot(character, slotTemplate);
+
+    if (existing >= kRandomizerUnequippedItemsPerSlot) {
+
+        return;
+
+    }
+
+    const RandomizerReplacementPool& pool =
+        randomizer_replacement_pool(slotTemplate,
+                                    replacementPools,
+                                    slotTemplate.weapon
+                                        ? std::nullopt
+                                        : std::optional<state::CharacterClass>{characterClass});
+
+    if (pool.choices.empty()) {
+
+        ++result.failures;
+
+        return;
+
+    }
+
+    for (std::size_t count = existing; count < kRandomizerUnequippedItemsPerSlot; ++count) {
+
+        const WeaponChoice& choice = pool.choices[rng.index(pool.choices.size())];
+
+        std::uint64_t insertedInstanceSoid = 0;
+
+        if (!state::insert_item_definition_unrestricted(choice.definition.definitionHash,
+                                                        insertedInstanceSoid)) {
+
+            ++result.failures;
+
+            break;
+
+        }
+
+        ++result.insertedItems;
+
+    }
+
+}
+
+void fill_randomizer_inventory(const state::CharacterState& character,
+                               RandomizerTarget targetMode,
+                               state::CharacterClass characterClass,
+                               RandomizerRng& rng,
+                               std::vector<RandomizerReplacementPool>& replacementPools,
+                               RandomizerResult& result) {
+
+    if (randomizer_wants_weapons(targetMode)) {
+
+        for (const inventory::EquipmentSlot slot : kWeaponSlots) {
+
+            fill_randomizer_slot(character,
+                                 slot,
+                                 characterClass,
+                                 rng,
+                                 replacementPools,
+                                 result);
+
+        }
+
+    }
+
+    if (randomizer_wants_armor(targetMode)) {
+
+        for (const inventory::EquipmentSlot slot : kArmorSlots) {
+
+            fill_randomizer_slot(character,
+                                 slot,
+                                 characterClass,
+                                 rng,
+                                 replacementPools,
+                                 result);
+
+        }
+
+    }
+
+}
+
+[[nodiscard]] RandomizerResult
+
+run_randomizer(const state::CharacterState& character,
+
+               RandomizerTarget targetMode,
+
+               RandomizerPerkMode perkMode) {
+
+    RandomizerResult result{};
+
+    RandomizerRng rng{};
+
+    if (!rng.initialize()) {
+
+        result.failures = 1;
+
+        return result;
+
+    }
+
+    std::vector<RandomizerReplacementPool> replacementPools{};
+
+    replacementPools.reserve(kWeaponSlots.size() + kArmorSlots.size());
+
+    fill_randomizer_inventory(character,
+                              targetMode,
+                              character.characterClass,
+                              rng,
+                              replacementPools,
+                              result);
+
+    const state::AccountState refreshed = state::account_snapshot();
+
+    const std::size_t refreshedCharacterIndex = selected_character_index(refreshed);
+
+    if (refreshedCharacterIndex >= refreshed.characterCount) {
+
+        ++result.failures;
+
+        return result;
+
+    }
+
+    const state::CharacterState& refreshedCharacter =
+        refreshed.characters[refreshedCharacterIndex];
+
+    std::vector<RandomizerItem> targets =
+        collect_randomizer_items(refreshedCharacter, targetMode);
+
+    result.targetItems = targets.size();
+
+    if (targets.empty()) {
+
+        return result;
+
+    }
+
+    RandomizerSocketCatalog socketCatalog{};
+
+    if (!load_randomizer_socket_catalog(socketCatalog)) {
+
+        result.failures += targets.size();
+
+        return result;
+
+    }
+
+    for (const RandomizerItem& target : targets) {
+
+        const RandomizerReplacementPool& replacementPool =
+
+            randomizer_replacement_pool(
+                target,
+                replacementPools,
+                target.weapon
+                    ? std::nullopt
+                    : std::optional<state::CharacterClass>{refreshedCharacter.characterClass});
+
+        const WeaponChoice* replacement =
+
+            choose_random_replacement(replacementPool, target.item.definitionHash, rng);
+
+        state::build_data::items::Definition activeDefinition = target.definition;
+
+        item_details::Definition activeDetail = target.detail;
+
+        bool replaced = false;
+
+        if (replacement != nullptr) {
+
+            if (state::replace_item_definition_unrestricted(target.item.instanceSoid,
+
+                                                            replacement->definition.definitionHash)) {
+
+                activeDefinition = replacement->definition;
+
+                activeDetail = replacement->detail;
+
+                replaced = true;
+
+                ++result.replacedItems;
+
+            } else {
+
+                ++result.failures;
+
+            }
+
+        }
+
+        for (std::uint8_t lane = 0; lane < activeDetail.ordinarySocketCount; ++lane) {
+
+            if (socket_kind(activeDetail, lane) == SocketKind::hidden) {
+
+                continue;
+
+            }
+
+            const std::optional<socket_plugs::Member> current =
+
+                current_randomizer_plug(target, activeDetail, lane, replaced);
+
+            std::span<const socket_plugs::Member> candidates =
+
+                compatible_randomizer_members(socketCatalog, activeDefinition.definitionIndex, lane);
+
+            if (randomizer_perk_lane(activeDetail, lane)) {
+
+                if (perkMode == RandomizerPerkMode::fullyRandom) {
+
+                    candidates = socketCatalog.chaoticPerks;
+
+                } else if (perkMode == RandomizerPerkMode::exoticOnly) {
+
+                    candidates = target.weapon
+                        ? std::span<const socket_plugs::Member>(socketCatalog.weaponExoticPerks)
+                        : std::span<const socket_plugs::Member>(socketCatalog.armorExoticPerks);
+
+                }
+
+            }
+
+            const std::optional<socket_plugs::Member> choice =
+
+                choose_random_member(candidates, current, rng);
+
+            if (!choice.has_value()) {
+
+                ++result.skippedSockets;
+
+                continue;
+
+            }
+
+            state::PendingSocketPlug mutation{};
+
+            if (!state::prepare_socket_plug_unrestricted(target.item.instanceSoid,
+
+                                                         lane,
+
+                                                         *choice,
+
+                                                         mutation)
+
+                || !state::commit_socket_plug(mutation)) {
+
+                ++result.failures;
+
+                continue;
+
+            }
+
+            ++result.randomizedSockets;
+
+        }
+
+    }
+
+    return result;
+
+}
+
+void randomize_character_inventory(const state::CharacterState& character) noexcept {
+
+    const RandomizerResult result = run_randomizer(character,
+
+                                                   g_randomizerTarget,
+
+                                                   g_randomizerPerkMode);
+
+    if (result.targetItems == 0) {
+
+        (void)std::snprintf(g_randomizerMessage.data(),
+
+                            g_randomizerMessage.size(),
+
+                            "No matching weapon or armor instances were found.");
+
+        core::ui::toast::post(core::ui::toast::Type::warning,
+
+                              "Gear Randomizer",
+
+                              "Nothing to randomize.");
+
+        return;
+
+    }
+
+    const state::AccountState after = state::account_snapshot();
+
+    const std::size_t characterIndex = selected_character_index(after);
+
+    const bool changed = result.insertedItems != 0 || result.replacedItems != 0
+        || result.randomizedSockets != 0;
+
+    const bool persisted = changed && characterIndex < after.characterCount
+
+        && persist_character(after.characters[characterIndex]);
+
+    const bool refreshQueued = changed && server::bap::request_account_resync();
+
+    (void)std::snprintf(g_randomizerMessage.data(),
+
+                        g_randomizerMessage.size(),
+
+                        "Processed %zu item(s): %zu added, %zu replaced, %zu socket(s) randomized, "
+
+                        "%zu skipped, %zu failed.%s%s",
+
+                        result.targetItems,
+
+                        result.insertedItems,
+
+                        result.replacedItems,
+
+                        result.randomizedSockets,
+
+                        result.skippedSockets,
+
+                        result.failures,
+
+                        changed ? (persisted ? " Saved." : " settings.json save failed.") : "",
+
+                        refreshQueued ? " Live refresh queued." : "");
+
+    if (!changed) {
+
+        core::ui::toast::post(core::ui::toast::Type::warning,
+
+                              "Gear Randomizer",
+
+                              "Randomizer made no changes.");
+
+    } else if (result.failures != 0 || !persisted) {
+
+        core::ui::toast::post(core::ui::toast::Type::warning,
+
+                              "Gear Randomizer",
+
+                              "Randomized with some failures.");
+
+    } else {
+
+        core::ui::toast::post(core::ui::toast::Type::success,
+
+                              "Gear Randomizer",
+
+                              "Inventory randomized and saved.");
+
+    }
+
+    clear_pending_changes();
+
+    invalidate_plug_cache();
+
+    invalidate_weapon_catalog();
+
+}
+
+[[nodiscard]] const char* randomizer_target_label(RandomizerTarget target) noexcept {
+
+    switch (target) {
+
+        case RandomizerTarget::weapons: return "Weapons";
+
+        case RandomizerTarget::armor: return "Armor";
+
+        default: return "Weapons + Armor";
+
+    }
+
+}
+
+[[nodiscard]] const char* randomizer_perk_mode_label(RandomizerPerkMode mode) noexcept {
+
+    switch (mode) {
+
+        case RandomizerPerkMode::normal: return "Normal / Compatible";
+
+        case RandomizerPerkMode::fullyRandom: return "Fully Random";
+
+        default: return "Exotic Only";
+
+    }
+
+}
+
+void draw_randomizer_panel(const state::CharacterState& character) noexcept {
+
+    const float width = (std::min)(ImGui::GetContentRegionAvail().x, scaled(760.0F));
+
+    if (ImGui::BeginChild("gear_randomizer",
+
+                          ImVec2(width, 0.0F),
+
+                          ImGuiChildFlags_Borders,
+
+                          ImGuiWindowFlags_None)) {
+
+        ImGui::TextDisabled("WHAT TO RANDOMIZE");
+
+        ImGui::Spacing();
+
+        if (ImGui::RadioButton("Weapons",
+
+                               g_randomizerTarget == RandomizerTarget::weapons)) {
+
+            g_randomizerTarget = RandomizerTarget::weapons;
+
+        }
+
+        ImGui::SameLine(0.0F, scaled(18.0F));
+
+        if (ImGui::RadioButton("Armor", g_randomizerTarget == RandomizerTarget::armor)) {
+
+            g_randomizerTarget = RandomizerTarget::armor;
+
+        }
+
+        ImGui::SameLine(0.0F, scaled(18.0F));
+
+        if (ImGui::RadioButton("Both", g_randomizerTarget == RandomizerTarget::both)) {
+
+            g_randomizerTarget = RandomizerTarget::both;
+
+        }
+
+        ImGui::Spacing();
+
+        ImGui::TextDisabled("Selected buckets are filled to 9 inventory items plus the equipped "
+                            "item before randomizing.");
+
+        ImGui::Spacing();
+
+        ImGui::Separator();
+
+        ImGui::Spacing();
+
+        ImGui::TextDisabled("PERK MODE");
+
+        ImGui::Spacing();
+
+        if (ImGui::RadioButton("Normal Perks",
+
+                               g_randomizerPerkMode == RandomizerPerkMode::normal)) {
+
+            g_randomizerPerkMode = RandomizerPerkMode::normal;
+
+        }
+
+        if (ImGui::RadioButton("Fully Random Perks",
+
+                               g_randomizerPerkMode == RandomizerPerkMode::fullyRandom)) {
+
+            g_randomizerPerkMode = RandomizerPerkMode::fullyRandom;
+
+        }
+
+        if (ImGui::RadioButton("Exotic Perks Only",
+
+                               g_randomizerPerkMode == RandomizerPerkMode::exoticOnly)) {
+
+            g_randomizerPerkMode = RandomizerPerkMode::exoticOnly;
+
+        }
+
+        ImGui::Spacing();
+
+        if (g_randomizerPerkMode == RandomizerPerkMode::normal) {
+
+            ImGui::TextWrapped("Uses the normal compatible plug pool for every socket.");
+
+        } else if (g_randomizerPerkMode == RandomizerPerkMode::fullyRandom) {
+
+            ImGui::TextWrapped("Perk sockets ignore normal item compatibility. Cosmetic and "
+
+                               "special sockets stay inside their normal compatible pools.");
+
+        } else {
+
+            ImGui::TextWrapped("Weapons use detected Exotic weapon perks/intrinsics; armor uses "
+
+                               "detected Exotic armor perks only.");
+
+        }
+
+        ImGui::Spacing();
+
+        ImGui::TextWrapped("This affects the equipped item and all 9 inventory slots for every "
+
+                           "selected weapon/armor bucket.");
+
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(0.95F, 0.72F, 0.18F, 1.0F),
+
+                           "Do not inspect inventory items in-game while the randomizer is running.");
+
+        ImGui::TextColored(ImVec4(0.95F, 0.72F, 0.18F, 1.0F),
+
+                           "WARNING: Some perk combinations can break weapons and make them unusable.");
+
+        ImGui::Spacing();
+
+        ImGui::Separator();
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("RANDOMIZE", ImVec2(scaled(190.0F), scaled(42.0F)))) {
+
+            ImGui::OpenPopup("Confirm Gear Randomizer");
+
+        }
+
+        if (g_randomizerMessage[0] != '\0') {
+
+            ImGui::Spacing();
+
+            ImGui::TextWrapped("%s", g_randomizerMessage.data());
+
+        }
+
+        if (ImGui::BeginPopupModal("Confirm Gear Randomizer",
+
+                                   nullptr,
+
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+
+            ImGui::TextWrapped("Randomize all %s using %s perks?",
+
+                               randomizer_target_label(g_randomizerTarget),
+
+                               randomizer_perk_mode_label(g_randomizerPerkMode));
+
+            ImGui::Spacing();
+
+            ImGui::TextWrapped("This fills the selected inventory buckets and rewrites every "
+
+                               "item in them.");
+
+            ImGui::Spacing();
+
+            if (ImGui::Button("Randomize", ImVec2(scaled(130.0F), 0.0F))) {
+
+                randomize_character_inventory(character);
+
+                ImGui::CloseCurrentPopup();
+
+            }
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Cancel", ImVec2(scaled(100.0F), 0.0F))) {
+
+                ImGui::CloseCurrentPopup();
+
+            }
+
+            ImGui::EndPopup();
+
+        }
+
+    }
+
+    ImGui::EndChild();
+
+}
+
 void set_editor_page(EditorPage page) noexcept {
 
     if (g_editorPage == page) {
@@ -4686,6 +6118,20 @@ void draw_editor_header() noexcept {
 
     }
 
+    ImGui::SameLine(0.0F, scaled(8.0F));
+
+    const bool randomizer = g_editorPage == EditorPage::randomizer;
+
+    if (draw_editor_page_tab("RANDOMIZER",
+                             randomizer,
+                             scaled(150.0F),
+                             tabHeight,
+                             scaled(-1.0F))) {
+
+        set_editor_page(EditorPage::randomizer);
+
+    }
+
     ImGui::SameLine(0.0F, scaled(18.0F));
 
     const float warningY = ImGui::GetCursorPosY();
@@ -4737,6 +6183,14 @@ void draw() noexcept {
     }
 
     draw_editor_header();
+
+    if (g_editorPage == EditorPage::randomizer) {
+
+        draw_randomizer_panel(account.characters[characterIndex]);
+
+        return;
+
+    }
 
     if (g_editorPage == EditorPage::weapons) {
 

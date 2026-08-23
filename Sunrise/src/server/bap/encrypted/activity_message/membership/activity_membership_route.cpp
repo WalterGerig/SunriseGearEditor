@@ -4,8 +4,7 @@
 #include <cstdio>
 
 #include "../../../../../core/logging/log.h"
-#include "../../../../../middleware/bap/activity_message/\
-activity_membership_acknowledgement_parser.h"
+#include "../../../../../middleware/bap/activity_message/activity_membership_acknowledgement_parser.h"
 #include "../../../../../middleware/bap/activity_message/activity_client_identity_parser.h"
 #include "../../../../../middleware/bap/activity_message/activity_state_refresh_parser.h"
 #include "../../../../../middleware/bap/activity_message/client_authoritative_data.h"

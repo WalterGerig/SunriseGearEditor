@@ -7,8 +7,7 @@
 
 #include "../../../../core/logging/log.h"
 #include "../../../../middleware/bap/activity_host_manager/request/activity_manager_request.h"
-#include "../../../../middleware/bap/activity_host_manager/request/selection/\
-activity_manager_selection_parser.h"
+#include "../../../../middleware/bap/activity_host_manager/request/selection/activity_manager_selection_parser.h"
 #include "../../../../middleware/bap/activity_host_manager/response/activity_manager_response.h"
 #include "../../../../state/activity/defaults/activity_defaults_snapshot.h"
 #include "../../../../state/activity/forced/activity_forced_destination.h"

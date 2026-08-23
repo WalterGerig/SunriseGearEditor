@@ -386,6 +386,19 @@ commit_profile_item_acquisition(PendingProfileItemAcquisition& mutation) noexcep
 [[nodiscard]] bool replace_item_definition_unrestricted(
     std::uint64_t targetInstanceSoid, std::uint32_t replacementDefinitionHash) noexcept;
 
+/**
+ * Inserts one installed instanced item directly into the selected character inventory.
+ *
+ * This editor-only path intentionally bypasses Collections ownership and material costs while
+ * still requiring the resulting account/loadout and native bucket placement to validate.
+ *
+ * @param definitionHash Installed item definition to insert.
+ * @param insertedInstanceSoid Receives the fresh runtime instance SOID on success.
+ * @return True when the selected character has room in the item's native inventory bucket.
+ */
+[[nodiscard]] bool insert_item_definition_unrestricted(
+    std::uint32_t definitionHash, std::uint64_t& insertedInstanceSoid) noexcept;
+
 [[nodiscard]] bool prepare_socket_plug(std::uint64_t targetInstanceSoid,
                                        std::uint8_t socketLane,
                                        std::uint16_t plugDefinitionIndex,

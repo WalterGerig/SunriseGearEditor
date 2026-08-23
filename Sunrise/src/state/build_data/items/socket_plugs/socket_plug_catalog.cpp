@@ -4,6 +4,7 @@
 #include <bitset>
 
 #include "../../table.h"
+#include "../details/item_detail_catalog.h"
 
 namespace sunrise::state::build_data::items::socket_plugs {
 namespace {
@@ -78,6 +79,27 @@ bool replace(std::span<const Rule> rules,
     for (const Member member : members) {
         membership.set(member);
     }
+
+    // Fixed/native plugs (notably Exotic armor intrinsics) are often authored only as a
+    // socket's initial plug and never appear in a selectable pool. The editor's unrestricted
+    // socket path must still be allowed to install those definitions. Add every configured
+    // native initial plug to the global-valid membership set while leaving allowed() unchanged;
+    // normal authored compatibility therefore stays exact.
+    for (std::size_t definitionIndex = 0; definitionIndex < details::kDefinitionCapacity;
+         ++definitionIndex) {
+        details::Definition detail{};
+        if (!details::find(static_cast<std::uint16_t>(definitionIndex), detail)
+            || detail.ordinarySocketState != details::OrdinarySocketState::present) {
+            continue;
+        }
+
+        for (std::size_t lane = 0; lane < detail.ordinarySocketCount; ++lane) {
+            const std::uint16_t initial = detail.initialPlugIndices[lane];
+            if (initial != details::kUnavailableItemIndex && initial < membership.size()) {
+                membership.set(initial);
+            }
+        }
+    }
     const Lock::Exclusive guard(g_lock);
     if (!g_rules.replace(rules) || !g_pools.replace(pools) || !g_members.replace(members)) {
         return false;
@@ -112,7 +134,10 @@ bool allowed(std::uint16_t itemDefinitionIndex,
     return std::binary_search(range.begin(), range.end(), plugDefinitionIndex);
 }
 
-/** Answers whether one definition occurs in any installed ordinary-socket plug pool. */
+/**
+ * Answers whether one definition is a valid ordinary-socket plug for editor/runtime use.
+ * This includes selectable pool members plus fixed native initial plugs.
+ */
 bool contains(Member plugDefinitionIndex) noexcept {
     const Lock::Shared guard(g_lock);
     return plugDefinitionIndex < g_membership.size() && g_membership.test(plugDefinitionIndex);

@@ -15,10 +15,10 @@
 namespace sunrise::core::ui::layout {
 namespace {
 
-/** The authored width leaves room for a narrow menu and a wide settings panel. */
-constexpr float kPreferredWindowWidth = 920.0F;
-/** The authored height fits a 720p viewport with game space left around it. */
-constexpr float kPreferredWindowHeight = 580.0F;
+/** The wider authored size gives content-heavy modules such as Gear Editor room for two columns. */
+constexpr float kPreferredWindowWidth = 1180.0F;
+/** The taller authored size leaves enough room for inventory and perk browsers. */
+constexpr float kPreferredWindowHeight = 660.0F;
 /** A 420-pixel minimum keeps the two columns from overlapping. */
 constexpr float kMinimumWindowWidth = 420.0F;
 /** A 300-pixel minimum keeps the navigation list and credits footer. */
@@ -33,10 +33,9 @@ constexpr float kNavigationWidth = 180.0F;
 constexpr float kAutomaticWidth = 0.0F;
 /** A half-axis pivot centers the window on both viewport axes. */
 constexpr ImVec2 kCenterPivot{0.5F, 0.5F};
-/** The main surface is fixed, has no title bar, and is left out of saved Dear ImGui state. */
+/** The main surface has no title bar, but keeps Dear ImGui's resize grip enabled. */
 constexpr ImGuiWindowFlags kMainWindowFlags =
-    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings
-    | ImGuiWindowFlags_NoTitleBar;
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoTitleBar;
 /** One trailing null byte turns a descriptor name into a component label. */
 constexpr std::size_t kLabelTerminatorBytes = 1;
 /** Fixed animation key. Every visibility-lane user needs its own, so keep these distinct. */
@@ -45,10 +44,6 @@ constexpr ImGuiID kSurfaceAnimationId = 1;
 constexpr animation::transition::Rates kVisibilityRates{16.0F, 14.0F};
 /** A closed surface has finished its transition and draws nothing. */
 constexpr float kClosedProgress = 0.0F;
-/** The surface grows from this fraction of its size while it opens. */
-constexpr float kOpeningScale = 0.96F;
-/** Full size, reached when the surface is fully open. */
-constexpr float kOpenScale = 1.0F;
 /** 34 authored pixels give the title logo presence without crowding the title row. */
 constexpr float kTitleLogoExtent = 34.0F;
 /** The title is drawn at this multiple of the body text, so it holds the logo's row. */
@@ -159,9 +154,19 @@ bool render(bool visible) noexcept {
         return false;
     }
 
-    const float scale = kOpeningScale + ((kOpenScale - kOpeningScale) * progress);
     ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, kCenterPivot);
-    ImGui::SetNextWindowSize({size.x * scale, size.y * scale}, ImGuiCond_Always);
+
+    // Set the authored size only when the window is created. After that Dear ImGui owns the size,
+    // so the bottom-right resize grip can be dragged without the next frame snapping it back.
+    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+
+    // Keep manual resizing inside the active game viewport and preserve the existing layout minimums.
+    const float margin = scaling::dpi::pixels(kViewportMargin);
+    const ImVec2 minimumSize{scaling::dpi::pixels(kMinimumWindowWidth),
+                             scaling::dpi::pixels(kMinimumWindowHeight)};
+    const ImVec2 maximumSize{viewport->Size.x - (margin * kViewportMarginCount),
+                             viewport->Size.y - (margin * kViewportMarginCount)};
+    ImGui::SetNextWindowSizeConstraints(minimumSize, maximumSize);
     // One style alpha fades the surface and everything drawn inside it together.
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, progress);
     const bool submitContents = ImGui::Begin("Sunrise", nullptr, kMainWindowFlags);

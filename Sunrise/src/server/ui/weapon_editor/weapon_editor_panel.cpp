@@ -34,6 +34,8 @@
 
 #include <cstring>
 
+#include <initializer_list>
+
 #include <cmath>
 
 #include <optional>
@@ -257,6 +259,18 @@ enum class RandomizerPerkMode : std::uint8_t {
 
 };
 
+enum class RandomizerArmorClass : std::uint8_t {
+
+    all,
+
+    titan,
+
+    hunter,
+
+    warlock,
+
+};
+
 enum class SocketKind : std::uint8_t {
 
     hidden,
@@ -294,6 +308,8 @@ EditorPage g_editorPage{EditorPage::weapons};
 RandomizerTarget g_randomizerTarget{RandomizerTarget::both};
 
 RandomizerPerkMode g_randomizerPerkMode{RandomizerPerkMode::normal};
+
+RandomizerArmorClass g_randomizerArmorClass{RandomizerArmorClass::all};
 
 std::array<char, 224> g_randomizerMessage{};
 
@@ -1363,6 +1379,33 @@ void stage_plug(const WeaponRow& weapon,
 
 }
 
+[[nodiscard]] bool armor_name_matches_character_class(
+    std::string_view name,
+    state::CharacterClass characterClass) noexcept {
+
+    const auto ends_with_any = [name](std::initializer_list<std::string_view> suffixes) noexcept {
+        return std::any_of(suffixes.begin(), suffixes.end(), [name](std::string_view suffix) {
+            return name.size() >= suffix.size()
+                   && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+        });
+    };
+
+    switch (characterClass) {
+        case state::CharacterClass::titan:
+            return ends_with_any({" Helm", " Helmet", " Gauntlets", " Plate", " Cuirass",
+                                  " Greaves", " Mark"});
+        case state::CharacterClass::hunter:
+            return ends_with_any({" Mask", " Cowl", " Grips", " Grasps", " Vest", " Harness",
+                                  " Strides", " Cloak"});
+        case state::CharacterClass::warlock:
+            return ends_with_any({" Hood", " Gloves", " Wraps", " Robes", " Raiment",
+                                  " Boots", " Bond"});
+    }
+
+    return false;
+
+}
+
 [[nodiscard]] bool armor_matches_character_class(
     const item_details::Definition& detail,
     state::CharacterClass characterClass) noexcept {
@@ -1373,31 +1416,58 @@ void stage_plug(const WeaponRow& weapon,
 
     }
 
-    bool hasClassSpecificArt = false;
+    const std::size_t classSlot = static_cast<std::size_t>(characterClass) + 1U;
 
-    for (std::size_t slot = 1; slot < detail.artArrangementIndices.size(); ++slot) {
+    if (classSlot < detail.artArrangementIndices.size()
+        && detail.artArrangementIndices[classSlot] != item_details::kUnavailableArtIndex) {
 
-        if (detail.artArrangementIndices[slot] != item_details::kUnavailableArtIndex) {
-
-            hasClassSpecificArt = true;
-
-            break;
-
-        }
-
-    }
-
-    if (!hasClassSpecificArt) {
-
-        // Some generic/universal armor only publishes the generic arrangement.
         return true;
 
     }
 
-    const std::size_t classSlot = static_cast<std::size_t>(characterClass) + 1U;
+    // If the definition explicitly declares another class's art but not ours, it is not ours.
+    const bool hasAnyClassSpecificArt =
+        std::any_of(detail.artArrangementIndices.begin() + 1,
+                    detail.artArrangementIndices.end(),
+                    [](std::uint16_t index) noexcept {
+                        return index != item_details::kUnavailableArtIndex;
+                    });
 
-    return classSlot < detail.artArrangementIndices.size()
-           && detail.artArrangementIndices[classSlot] != item_details::kUnavailableArtIndex;
+    if (hasAnyClassSpecificArt) {
+
+        return false;
+
+    }
+
+    // A lot of the legacy armor in this build only exposes generic art, so the strict art-only
+    // test produced an empty replacement pool (one failure for each of the five armor slots).
+    // For those rows, use Destiny's class-specific armor naming conventions instead of treating
+    // every generic-art definition as universal. Unknown/ambiguous names stay out of a
+    // class-specific pool and remain available through All Classes.
+    return armor_name_matches_character_class(display_name(detail.definitionHash), characterClass);
+
+}
+
+[[nodiscard]] bool is_exotic_armor_detail(const item_details::Definition& detail) noexcept {
+
+    return is_armor_detail(detail)
+           && weapon_rarity(detail.definitionHash) == WeaponRarity::exotic;
+
+}
+
+[[nodiscard]] bool has_renderable_gear_art(const item_details::Definition& detail) noexcept {
+
+    if (detail.gearArtIndex != item_details::kUnavailableArtIndex) {
+
+        return true;
+
+    }
+
+    return std::any_of(detail.artArrangementIndices.begin(),
+                       detail.artArrangementIndices.end(),
+                       [](std::uint16_t index) noexcept {
+                           return index != item_details::kUnavailableArtIndex;
+                       });
 
 }
 
@@ -1425,12 +1495,12 @@ void stage_plug(const WeaponRow& weapon,
 
     }
 
-    // Native socket type 677 is the armor intrinsic lane. It is the exact lane that carries
-    // Exotic armor perks, and is much more precise than treating every armor perk-like socket
-    // as Exotic.
+    // Native socket type 677 is the armor intrinsic lane, but its authored plug pool can contain
+    // shared/ordinary armor plugs as well. Treat the lane as armor here; the exact Exotic perk is
+    // promoted separately from each Exotic armor item's native initial plug.
     if (!weapon && is_armor_detail(detail) && type == 677) {
 
-        return kPlugCategoryArmorExoticPerk;
+        return kPlugCategoryArmorMod;
 
     }
 
@@ -1488,6 +1558,15 @@ void rebuild_plug_categories() {
     }
 
     g_plugCategoryByDefinition.assign(definitionCount, kPlugCategoryNone);
+
+    // Armor socket type 677 is the intrinsic lane, but its authored pools also contain generic
+    // armor plugs. Build the Exotic pool from definitions that are actually associated with
+    // Exotic hosts, while subtracting anything also used by ordinary armor. Native initial plugs
+    // are useful evidence too, but only when they are real published socket plugs.
+    std::vector<bool> exoticArmorInitialPerks(definitionCount, false);
+    std::vector<bool> ordinaryArmorInitialPerks(definitionCount, false);
+    std::vector<bool> exoticArmorIntrinsicMembers(definitionCount, false);
+    std::vector<bool> ordinaryArmorIntrinsicMembers(definitionCount, false);
 
     std::vector<socket_plugs::Rule> rules(socket_plugs::kRuleCapacity);
 
@@ -1549,6 +1628,22 @@ void rebuild_plug_categories() {
 
         }
 
+        const bool armorIntrinsicLane = is_armor_detail(detail)
+            && rule.lane < detail.ordinarySocketCount && detail.socketTypes[rule.lane] == 677;
+        const bool exoticArmorHost = armorIntrinsicLane && is_exotic_armor_detail(detail);
+
+        if (armorIntrinsicLane) {
+            const std::uint16_t initial = detail.initialPlugIndices[rule.lane];
+            if (initial != item_details::kUnavailableItemIndex
+                && static_cast<std::size_t>(initial) < exoticArmorInitialPerks.size()) {
+                if (exoticArmorHost) {
+                    exoticArmorInitialPerks[initial] = true;
+                } else {
+                    ordinaryArmorInitialPerks[initial] = true;
+                }
+            }
+        }
+
         for (std::size_t memberIndex = first; memberIndex < first + count; ++memberIndex) {
 
             const std::size_t definitionIndex = static_cast<std::size_t>(members[memberIndex]);
@@ -1557,13 +1652,25 @@ void rebuild_plug_categories() {
 
                 g_plugCategoryByDefinition[definitionIndex] |= category;
 
+                if (armorIntrinsicLane) {
+                    if (exoticArmorHost) {
+                        exoticArmorIntrinsicMembers[definitionIndex] = true;
+                    } else {
+                        ordinaryArmorIntrinsicMembers[definitionIndex] = true;
+                    }
+                }
+
             }
 
         }
 
     }
 
-    for (PlugCategoryMask& categories : g_plugCategoryByDefinition) {
+    for (std::size_t definitionIndex = 0;
+         definitionIndex < g_plugCategoryByDefinition.size();
+         ++definitionIndex) {
+
+        PlugCategoryMask& categories = g_plugCategoryByDefinition[definitionIndex];
 
         if ((categories & kPlugCategoryExoticIntrinsic) != 0) {
 
@@ -1571,10 +1678,30 @@ void rebuild_plug_categories() {
 
         }
 
-        if ((categories & kPlugCategoryArmorExoticPerk) != 0) {
+        const bool publishedSocketPlug = definitionIndex <= 0xFFFFU
+            && state::build_data::is_socket_plug_valid(
+                static_cast<std::uint16_t>(definitionIndex));
 
+        // Two independent signals qualify an Exotic armor perk:
+        //  1) it is a native initial plug on Exotic armor and is a real published socket plug; or
+        //  2) it occurs in a 677 pool used by Exotic armor but never in a 677 pool used by
+        //     ordinary armor.
+        // Anything known as an ordinary armor initial is explicitly excluded. This keeps generic
+        // armor mods out without collapsing the pool to only a handful of often-unpublished
+        // initial definitions.
+        const bool exoticNativeInitial = exoticArmorInitialPerks[definitionIndex]
+            && publishedSocketPlug
+            && !ordinaryArmorInitialPerks[definitionIndex];
+        const bool exoticExclusiveMember = exoticArmorIntrinsicMembers[definitionIndex]
+            && !ordinaryArmorIntrinsicMembers[definitionIndex]
+            && !ordinaryArmorInitialPerks[definitionIndex];
+        const bool exactExoticArmorPerk = exoticNativeInitial || exoticExclusiveMember;
+
+        if (exactExoticArmorPerk) {
+            categories |= kPlugCategoryArmorExoticPerk;
             categories &= static_cast<PlugCategoryMask>(~kPlugCategoryArmorMod);
-
+        } else {
+            categories &= static_cast<PlugCategoryMask>(~kPlugCategoryArmorExoticPerk);
         }
 
     }
@@ -4119,7 +4246,7 @@ void draw_plug_filter_popup() noexcept {
     ImGui::Separator();
 
         if (g_editorPage == EditorPage::armor) {
-        plug_filter_option("Exotic Perks", kPlugCategoryArmorExoticPerk);
+        plug_filter_option("Exotic Armor Perks", kPlugCategoryArmorExoticPerk);
         plug_filter_option("Armor Mods", kPlugCategoryArmorMod);
         plug_filter_option("Shaders", kPlugCategoryShader);
         plug_filter_option("Ornaments", kPlugCategoryOrnament);
@@ -4806,6 +4933,10 @@ struct RandomizerSocketCatalog {
 
     std::vector<socket_plugs::Member> chaoticPerks{};
 
+    std::vector<socket_plugs::Member> chaoticWeaponPerks{};
+
+    std::vector<socket_plugs::Member> chaoticArmorMods{};
+
     std::vector<socket_plugs::Member> weaponExoticPerks{};
 
     std::vector<socket_plugs::Member> armorExoticPerks{};
@@ -5000,6 +5131,17 @@ randomizer_replacement_pool(const RandomizerItem& item,
 
         }
 
+        // Bucket/native-slot equality can also match internal or placeholder gear rows.
+        // They are valid enough for State, but can render as an empty inventory tile. Randomizer
+        // replacement pools therefore keep only the same broad gear kind with actual gear art.
+        if ((item.weapon && !is_weapon_detail(detail))
+            || (!item.weapon && !is_armor_detail(detail))
+            || !has_renderable_gear_art(detail)) {
+
+            continue;
+
+        }
+
         if (armorClass.has_value() && is_armor_detail(detail)
             && !armor_matches_character_class(detail, *armorClass)) {
 
@@ -5110,8 +5252,10 @@ choose_random_replacement(const RandomizerReplacementPool& pool,
 
     };
 
-    // Build the Exotic pools from their native intrinsic socket rules. Weapon intrinsic 176 and
-    // armor intrinsic 677 stay separate, so armor can never receive the weapon-only Exotic pool.
+    // Keep the original working Exotic-only behavior: build both Exotic pools directly from
+    // their native socket-rule pools. Armor uses native socket type 677. This intentionally does
+    // NOT apply the Randomizer Armor Class filter, so Titan/Hunter/Warlock Exotic armor perks can
+    // all be rolled onto whichever class's armor items were generated.
     for (const socket_plugs::Rule& rule : catalog.rules) {
 
         if (rule.poolIndex >= catalog.pools.size()) {
@@ -5196,7 +5340,22 @@ choose_random_replacement(const RandomizerReplacementPool& pool,
 
         }
 
-        // Exotic pools are collected from their actual Exotic host-item socket rules above.
+        if ((categories & kPlugCategoryWeaponPerk) != 0
+            && (categories & (kPlugCategoryIntrinsic | kPlugCategoryExoticIntrinsic)) == 0) {
+
+            catalog.chaoticWeaponPerks.push_back(definitionIndex);
+
+        }
+
+        if ((categories & kPlugCategoryArmorMod) != 0
+            && (categories & kPlugCategoryArmorExoticPerk) == 0) {
+
+            catalog.chaoticArmorMods.push_back(definitionIndex);
+
+        }
+
+        // Exotic-only pools are collected from the native socket rules above. In particular, the
+        // armor pool comes from every armor socket-677 rule across all three classes.
 
     }
 
@@ -5379,7 +5538,8 @@ constexpr std::size_t kRandomizerUnequippedItemsPerSlot = 9;
 
 [[nodiscard]] std::size_t randomizer_inventory_count_for_slot(
     const state::CharacterState& character,
-    const RandomizerItem& slotTemplate) {
+    const RandomizerItem& slotTemplate,
+    std::optional<state::CharacterClass> armorClass) {
 
     std::size_t count = 0;
 
@@ -5395,12 +5555,21 @@ constexpr std::size_t kRandomizerUnequippedItemsPerSlot = 9;
 
         }
 
-        if (definition.bucketId == slotTemplate.definition.bucketId
-            && detail.equipmentSlot == slotTemplate.detail.equipmentSlot) {
+        if (definition.bucketId != slotTemplate.definition.bucketId
+            || detail.equipmentSlot != slotTemplate.detail.equipmentSlot) {
 
-            ++count;
+            continue;
 
         }
+
+        if (!slotTemplate.weapon && armorClass.has_value()
+            && !armor_matches_character_class(detail, *armorClass)) {
+
+            continue;
+
+        }
+
+        ++count;
 
     }
 
@@ -5426,7 +5595,7 @@ struct RandomizerResult {
 
 void fill_randomizer_slot(const state::CharacterState& character,
                           inventory::EquipmentSlot slot,
-                          state::CharacterClass characterClass,
+                          std::optional<state::CharacterClass> armorClass,
                           RandomizerRng& rng,
                           std::vector<RandomizerReplacementPool>& replacementPools,
                           RandomizerResult& result) {
@@ -5441,7 +5610,8 @@ void fill_randomizer_slot(const state::CharacterState& character,
 
     }
 
-    const std::size_t existing = randomizer_inventory_count_for_slot(character, slotTemplate);
+    const std::size_t existing = randomizer_inventory_count_for_slot(
+        character, slotTemplate, slotTemplate.weapon ? std::nullopt : armorClass);
 
     if (existing >= kRandomizerUnequippedItemsPerSlot) {
 
@@ -5452,9 +5622,7 @@ void fill_randomizer_slot(const state::CharacterState& character,
     const RandomizerReplacementPool& pool =
         randomizer_replacement_pool(slotTemplate,
                                     replacementPools,
-                                    slotTemplate.weapon
-                                        ? std::nullopt
-                                        : std::optional<state::CharacterClass>{characterClass});
+                                    slotTemplate.weapon ? std::nullopt : armorClass);
 
     if (pool.choices.empty()) {
 
@@ -5487,7 +5655,7 @@ void fill_randomizer_slot(const state::CharacterState& character,
 
 void fill_randomizer_inventory(const state::CharacterState& character,
                                RandomizerTarget targetMode,
-                               state::CharacterClass characterClass,
+                               std::optional<state::CharacterClass> armorClass,
                                RandomizerRng& rng,
                                std::vector<RandomizerReplacementPool>& replacementPools,
                                RandomizerResult& result) {
@@ -5498,7 +5666,7 @@ void fill_randomizer_inventory(const state::CharacterState& character,
 
             fill_randomizer_slot(character,
                                  slot,
-                                 characterClass,
+                                 armorClass,
                                  rng,
                                  replacementPools,
                                  result);
@@ -5513,12 +5681,29 @@ void fill_randomizer_inventory(const state::CharacterState& character,
 
             fill_randomizer_slot(character,
                                  slot,
-                                 characterClass,
+                                 armorClass,
                                  rng,
                                  replacementPools,
                                  result);
 
         }
+
+    }
+
+}
+
+[[nodiscard]] std::optional<state::CharacterClass>
+randomizer_armor_class(RandomizerArmorClass selection) noexcept {
+
+    switch (selection) {
+
+        case RandomizerArmorClass::titan: return state::CharacterClass::titan;
+
+        case RandomizerArmorClass::hunter: return state::CharacterClass::hunter;
+
+        case RandomizerArmorClass::warlock: return state::CharacterClass::warlock;
+
+        default: return std::nullopt;
 
     }
 
@@ -5530,7 +5715,9 @@ run_randomizer(const state::CharacterState& character,
 
                RandomizerTarget targetMode,
 
-               RandomizerPerkMode perkMode) {
+               RandomizerPerkMode perkMode,
+
+               RandomizerArmorClass armorClassMode) {
 
     RandomizerResult result{};
 
@@ -5548,9 +5735,12 @@ run_randomizer(const state::CharacterState& character,
 
     replacementPools.reserve(kWeaponSlots.size() + kArmorSlots.size());
 
+    const std::optional<state::CharacterClass> armorClass =
+        randomizer_armor_class(armorClassMode);
+
     fill_randomizer_inventory(character,
                               targetMode,
-                              character.characterClass,
+                              armorClass,
                               rng,
                               replacementPools,
                               result);
@@ -5598,9 +5788,7 @@ run_randomizer(const state::CharacterState& character,
             randomizer_replacement_pool(
                 target,
                 replacementPools,
-                target.weapon
-                    ? std::nullopt
-                    : std::optional<state::CharacterClass>{refreshedCharacter.characterClass});
+                target.weapon ? std::nullopt : armorClass);
 
         const WeaponChoice* replacement =
 
@@ -5646,18 +5834,25 @@ run_randomizer(const state::CharacterState& character,
 
                 current_randomizer_plug(target, activeDetail, lane, replaced);
 
-            std::span<const socket_plugs::Member> candidates =
+            const std::span<const socket_plugs::Member> compatibleCandidates =
 
                 compatible_randomizer_members(socketCatalog, activeDefinition.definitionIndex, lane);
+
+            std::span<const socket_plugs::Member> candidates = compatibleCandidates;
 
             if (randomizer_perk_lane(activeDetail, lane)) {
 
                 if (perkMode == RandomizerPerkMode::fullyRandom) {
 
+                    // Intentionally chaotic: any perk-like definition may be written into any
+                    // perk-like lane, even when that combination was never authored for the item.
                     candidates = socketCatalog.chaoticPerks;
 
                 } else if (perkMode == RandomizerPerkMode::exoticOnly) {
 
+                    // Also intentionally chaotic within the selected gear family: every perk-like
+                    // weapon lane may receive any detected Exotic weapon perk, and every perk-like
+                    // armor lane may receive any detected Exotic armor perk.
                     candidates = target.weapon
                         ? std::span<const socket_plugs::Member>(socketCatalog.weaponExoticPerks)
                         : std::span<const socket_plugs::Member>(socketCatalog.armorExoticPerks);
@@ -5712,7 +5907,9 @@ void randomize_character_inventory(const state::CharacterState& character) noexc
 
                                                    g_randomizerTarget,
 
-                                                   g_randomizerPerkMode);
+                                                   g_randomizerPerkMode,
+
+                                                   g_randomizerArmorClass);
 
     if (result.targetItems == 0) {
 
@@ -5831,6 +6028,22 @@ void randomize_character_inventory(const state::CharacterState& character) noexc
 
 }
 
+[[nodiscard]] const char* randomizer_armor_class_label(RandomizerArmorClass armorClass) noexcept {
+
+    switch (armorClass) {
+
+        case RandomizerArmorClass::titan: return "Titan";
+
+        case RandomizerArmorClass::hunter: return "Hunter";
+
+        case RandomizerArmorClass::warlock: return "Warlock";
+
+        default: return "All Classes";
+
+    }
+
+}
+
 void draw_randomizer_panel(const state::CharacterState& character) noexcept {
 
     const float width = (std::min)(ImGui::GetContentRegionAvail().x, scaled(760.0F));
@@ -5876,6 +6089,58 @@ void draw_randomizer_panel(const state::CharacterState& character) noexcept {
         ImGui::TextDisabled("Selected buckets are filled to 9 inventory items plus the equipped "
                             "item before randomizing.");
 
+        if (randomizer_wants_armor(g_randomizerTarget)) {
+
+            ImGui::Spacing();
+
+            ImGui::TextDisabled("ARMOR CLASS");
+
+            ImGui::SetNextItemWidth(scaled(220.0F));
+
+            if (ImGui::BeginCombo("##randomizer_armor_class",
+                                  randomizer_armor_class_label(g_randomizerArmorClass))) {
+
+                constexpr std::array<RandomizerArmorClass, 4> kArmorClasses{
+                    RandomizerArmorClass::all,
+                    RandomizerArmorClass::titan,
+                    RandomizerArmorClass::hunter,
+                    RandomizerArmorClass::warlock,
+                };
+
+                for (const RandomizerArmorClass armorClass : kArmorClasses) {
+
+                    const bool selected = armorClass == g_randomizerArmorClass;
+
+                    if (ImGui::Selectable(randomizer_armor_class_label(armorClass), selected)) {
+
+                        g_randomizerArmorClass = armorClass;
+
+                    }
+
+                    if (selected) {
+
+                        ImGui::SetItemDefaultFocus();
+
+                    }
+
+                }
+
+                ImGui::EndCombo();
+
+            }
+
+            if (g_randomizerArmorClass == RandomizerArmorClass::all) {
+
+                ImGui::TextDisabled("All Classes allows armor from Titan, Hunter and Warlock.");
+
+            } else {
+
+                ImGui::TextDisabled("Specific classes use class art/name signals; ambiguous armor is excluded.");
+
+            }
+
+        }
+
         ImGui::Spacing();
 
         ImGui::Separator();
@@ -5918,15 +6183,17 @@ void draw_randomizer_panel(const state::CharacterState& character) noexcept {
 
         } else if (g_randomizerPerkMode == RandomizerPerkMode::fullyRandom) {
 
-            ImGui::TextWrapped("Perk sockets ignore normal item compatibility. Cosmetic and "
+            ImGui::TextWrapped("Perk-like definitions can cross normal item compatibility, "
 
-                               "special sockets stay inside their normal compatible pools.");
+                               "including intrinsic lanes. This mode is intentionally chaotic.");
 
         } else {
 
-            ImGui::TextWrapped("Weapons use detected Exotic weapon perks/intrinsics; armor uses "
+            ImGui::TextWrapped("Weapons use detected Exotic weapon perks; armor uses only "
 
-                               "detected Exotic armor perks only.");
+                               "native Exotic armor perks from all three classes. The Armor "
+
+                               "Class filter affects armor pieces only, never the Exotic perks.");
 
         }
 
@@ -5977,6 +6244,13 @@ void draw_randomizer_panel(const state::CharacterState& character) noexcept {
                                randomizer_target_label(g_randomizerTarget),
 
                                randomizer_perk_mode_label(g_randomizerPerkMode));
+
+            if (randomizer_wants_armor(g_randomizerTarget)) {
+
+                ImGui::Text("Armor class: %s",
+                            randomizer_armor_class_label(g_randomizerArmorClass));
+
+            }
 
             ImGui::Spacing();
 

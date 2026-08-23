@@ -32,6 +32,14 @@ I do not provide support for installation, bugs, crashes, compatibility issues o
 
 This is an unofficial project and is not supported by the Sunrise development team.
 
+## Coming Features
+
+I Know i just said there be further development, but there is still some featues i have planned, for example:
+
+- Gear Randomizer: Only Weapons, only Armor, Both and you will have the option, to chose only normal perks, fully Random Perks or only Exotic Perks to unleash full chaos
+
+- Small Bug fixes, for example The Armor Exotic Perk filter not working
+
 ## Development / Usage
 
 Feel free to study, modify, fork, improve or build upon my Gear Editor implementation.

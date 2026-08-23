@@ -17,12 +17,6 @@ An unofficial Gear Editor for Sunrise that allows weapons and armor to be edited
 - Change mods, perks, shaders and ornaments
 - Apply perks and mods without the normal slot restrictions
 
-## Known Issues
-
-- The filter for Exotic Armor perks does not currently work correctly.
-- Replacing an item while inspecting that item in the in-game inventory can cause the game to freeze.
-
-The Exotic Armor perk filter will not be fixed by me. If somebody wants to fix it, feel free to do so.
 
 ## Support
 

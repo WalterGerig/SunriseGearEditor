@@ -4,7 +4,7 @@ An unofficial Gear Editor for Sunrise that allows weapons and armor to be edited
 
 ## Bug Reporting
 
-If you encounter any bugs or game crashes Please open a Issue in this github repo and try to explain how the bug happend or the game crashed
+If you encounter any bugs or game crashes Please open a Issue in this github repo and try to explain how the bug happend or the game crashed.
 
 ## Features
 

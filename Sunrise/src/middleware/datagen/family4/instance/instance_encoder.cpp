@@ -66,7 +66,7 @@ namespace {
     for (std::size_t index = 0; index < input.socketEntryStates.size(); ++index) {
         const SocketEntryState state = input.socketEntryStates[index];
         if (state != SocketEntryState::absent && state != SocketEntryState::ready
-            && state != SocketEntryState::active) {
+            && state != SocketEntryState::acquired && state != SocketEntryState::active) {
             return false;
         }
         if (index >= input.socketEntryCount && state != SocketEntryState::absent) {
@@ -150,6 +150,7 @@ bool encode(const ResolvedInstance& input, std::span<std::byte> output) noexcept
             const std::optional<std::uint16_t>& plug = input.ordinarySockets.plugs[index];
             if (plug.has_value()) {
                 object.ordinarySockets.sockets[index].plugDefinitionIndex = *plug;
+                // Auxiliary fields stay zero; nonzero values change the available plug choices.
             }
         }
     }

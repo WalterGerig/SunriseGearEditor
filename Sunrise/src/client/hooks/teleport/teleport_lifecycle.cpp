@@ -78,13 +78,14 @@ template <typename T> [[nodiscard]] T original(std::size_t slot) noexcept {
 std::int64_t __fastcall camera_transform(std::uint32_t playerIndex) noexcept {
     const CameraTransform next = original<CameraTransform>(kCameraSlot);
     const std::int64_t result = next != nullptr ? next(playerIndex) : 0;
-    capture_forward(playerIndex);
+    capture_camera_pose(playerIndex);
     poll_request();
     force_pending();
     // Read here, not on the physics tick: that tick stops for a player who is standing still.
     hooks::fly::poll_toggle();
     client::player::position::poll();
     hooks::bootflow::poll_world_step();
+    hooks::bootflow::poll_current_slice_set();
     return result;
 }
 
@@ -203,7 +204,16 @@ void uninstall() noexcept {
     hooks::fly::reset();
     client::player::position::reset();
     polled_input::release_key();
-    (void)hooking::detour::uninstall(g_handles);
+    // A thread still inside a replacement keeps the detours; the cleared targets make them inert.
+    bool replacementActive = false;
+    if (!hooking::detour::uninstall(g_handles, replacementActive)) {
+        core::log::write(core::log::Channel::client,
+                         core::log::Level::warn,
+                         replacementActive
+                             ? "ev=teleport stage=uninstall result=fail reason=active"
+                             : "ev=teleport stage=uninstall result=fail reason=detach");
+        return;
+    }
     g_handles = {};
 }
 

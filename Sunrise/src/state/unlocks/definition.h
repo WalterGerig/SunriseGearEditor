@@ -32,13 +32,15 @@ using ProgressionBank = std::array<ProgressionLanes, build_data::progressions::k
 
 /** A set acquired flag is stored as its biased 2-bit true value. */
 inline constexpr std::uint8_t kFlagSet = 2;
-/** A clear acquired flag is stored as zero. */
-inline constexpr std::uint8_t kFlagClear = 0;
 
 /**
- * Authored unlock policy published once for the process.
- * Every bank is expanded at parse time, so readers copy bytes with no run decoding.
+ * A clear acquired flag is stored as zero.
+ * The 2-bit field encodes redeemed state only; no value of it means claimable. Claimable is an
+ * objective value equal to its record's completionValue while this flag stays clear.
  */
+inline constexpr std::uint8_t kFlagClear = 0;
+
+/** Call-local unlock banks expanded from the investment store. */
 struct Table {
     std::array<std::uint8_t, kAccountFlagCapacity> accountFlags{};
     std::array<std::uint8_t, kProfileFlagCapacity> profileFlags{};

@@ -8,6 +8,7 @@
 #include "../activity/definition.h"
 #include "../investment/investment.h"
 #include "../matchmaking/definition.h"
+#include "../steam/definition.h"
 
 namespace sunrise::state {
 
@@ -46,10 +47,9 @@ struct BapState {
 struct State {
     SignOnState signOn;
     BapState bap;
-    AccountState account;
     activity::ActivityState activity;
-    InvestmentState investment;
     matchmaking::MatchmakingState matchmaking;
+    steam::SteamState steam;
 };
 
 } // namespace sunrise::state

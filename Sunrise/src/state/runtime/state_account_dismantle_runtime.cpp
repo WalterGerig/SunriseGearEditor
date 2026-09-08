@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../investment/store_internal.h"
 #include "runtime.h"
 #include "state_account_transaction_helpers.h"
 #include "storage/internal.h"
@@ -69,8 +70,8 @@ bool preview_item_dismantle(const PendingItemDismantle& mutation, AccountState& 
 
 /** Commits one prepared dismantle only while its complete account views are unchanged. */
 bool commit_item_dismantle(PendingItemDismantle& mutation) noexcept {
-    const PendingItemDismantle prepared = mutation;
-    mutation = {};
+    const PendingItemDismantle& prepared = mutation;
+    const PendingConsumption consume{mutation};
     const auto fail = [&prepared](std::string_view reason) noexcept {
         report_dismantle("commit",
                          "fail",
@@ -98,14 +99,17 @@ bool commit_item_dismantle(PendingItemDismantle& mutation) noexcept {
                      prepared.movedInventoryItemCount,
                      prepared.afterCharacter.nextInventorySerial);
 
-    AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
+    investment::store::g_mutex.lock();
     AccountState candidate{};
     const bool ready =
-        materialize_item_dismantle(runtime::storage::g_state.account, prepared, candidate);
+        materialize_item_dismantle(investment::store::account(), prepared, candidate);
     if (ready) {
-        runtime::storage::g_state.account = candidate;
+        if (!investment::store::write_account(candidate)) {
+            investment::store::g_mutex.unlock();
+            return false;
+        }
     }
-    ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
+    investment::store::g_mutex.unlock();
 
     if (!ready) {
         return fail("stale_or_invalid");

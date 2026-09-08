@@ -5,6 +5,7 @@
 #include "../../../runtime/storage/internal.h"
 #include "../activity_membership_query.h"
 #include "internal.h"
+#include "state/investment/store_internal.h"
 
 namespace sunrise::state::activity::membership {
 namespace {
@@ -56,26 +57,49 @@ namespace {
 }
 
 /**
- * Checks one read-only refresh plan against current State.
+ * Checks one refresh plan against current State and keeps the bubble it named.
  * @param record Target joined session record.
  * @param prepared Refresh plan, consumed here.
  * @return True when the request guard and snapshot still match.
  */
-[[nodiscard]] bool commit_refresh(const SessionRecord& record,
-                                  const PendingMutation& prepared) noexcept {
+[[nodiscard]] bool commit_refresh(SessionRecord& record, const PendingMutation& prepared) noexcept {
     if (prepared.refreshRequestGuard
         != transactions::refresh_guard(prepared.requestedRevision, prepared.bubbleIndex)) {
         return false;
     }
-    if (!record.membership.hasIdentity) {
-        return !prepared.hasSnapshot;
-    }
-    if (!prepared.hasSnapshot) {
+    if (record.membership.hasIdentity) {
+        if (!prepared.hasSnapshot) {
+            return false;
+        }
+        const Snapshot expected = transactions::make_snapshot(
+            record.membership, record.membership.identity, record.membership.revision);
+        if (!transactions::equal(prepared.snapshot, expected)) {
+            return false;
+        }
+    } else if (prepared.hasSnapshot) {
         return false;
     }
-    const Snapshot expected = transactions::make_snapshot(
-        record.membership, record.membership.identity, record.membership.revision);
-    return transactions::equal(prepared.snapshot, expected);
+    // The bubble is the client saying which slice set it holds. It is not a published field, so
+    // no revision moves.
+    record.membership.bubble = prepared.bubbleIndex;
+    record.membership.bubbleRevision = prepared.requestedRevision;
+    return true;
+}
+
+/** Applies one prepared revision advance to the exact current membership snapshot. */
+[[nodiscard]] bool commit_republish(ActivityState& state,
+                                    SessionRecord& record,
+                                    const PendingMutation& prepared) noexcept {
+    if (!prepared.hasSnapshot || !record.membership.hasIdentity
+        || record.membership.revision == kMaximumMembershipRevision
+        || prepared.snapshot.revision != record.membership.revision + 1U
+        || !transactions::equal(prepared.snapshot.identity, record.membership.identity)) {
+        return false;
+    }
+    ++record.membership.revision;
+    record.membership.acknowledgedRevision = kAbsentRevision;
+    transactions::publish_change(state, record);
+    return true;
 }
 
 /**
@@ -103,36 +127,11 @@ namespace {
 
 } // namespace
 
-/** Advances the published membership revision so an already-applied snapshot can be corrected. */
-bool republish(std::uint64_t sessionId) noexcept {
-    if (sessionId == kAbsentSessionId) {
-        return false;
+/** Commits one identity, client-state, refresh, or acknowledgement operation. */
+bool commit(PendingMutation& mutation, CommittedClientState* clientState) noexcept {
+    if (clientState != nullptr) {
+        *clientState = {};
     }
-    bool advanced = false;
-    AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
-    auto& root = runtime::storage::g_state;
-    ActivityState& state = root.activity;
-    for (SessionRecord& record : state.sessions) {
-        if (!record.occupied || !record.joined || record.sessionId != sessionId) {
-            continue;
-        }
-        // A record with no identity has published nothing. Its first identity carries the
-        // current body anyway.
-        if (record.membership.hasIdentity && state.stateRevision != activity::kMaximumRevision
-            && record.membership.revision != kMaximumMembershipRevision) {
-            ++record.membership.revision;
-            record.membership.acknowledgedRevision = kAbsentRevision;
-            transactions::publish_change(state, record);
-            advanced = true;
-        }
-        break;
-    }
-    ReleaseSRWLockExclusive(&runtime::storage::g_stateLock);
-    return advanced;
-}
-
-/** Commits one identity, authoritative, refresh, or acknowledgement operation. */
-bool commit(PendingMutation& mutation) noexcept {
     const PendingMutation prepared = mutation;
     mutation = {};
     if (!prepared.prepared || prepared.kind == MutationKind::none
@@ -143,6 +142,8 @@ bool commit(PendingMutation& mutation) noexcept {
         return false;
     }
 
+    const std::lock_guard accountGuard(investment::store::g_mutex);
+    const auto primarySoid = investment::store::account().primarySoid;
     AcquireSRWLockExclusive(&runtime::storage::g_stateLock);
     auto& root = runtime::storage::g_state;
     ActivityState& state = root.activity;
@@ -151,13 +152,19 @@ bool commit(PendingMutation& mutation) noexcept {
                      && record.joined && record.joinedRevision != kInvalidRevision
                      && record.sessionId == prepared.sessionId
                      && record.recordRevision == prepared.expectedRecordRevision
-                     && root.account.primarySoid == prepared.expectedPrimarySoid;
+                     && primarySoid == prepared.expectedPrimarySoid;
     if (committed && prepared.kind == MutationKind::identity) {
         committed = commit_identity(state, record, prepared);
     } else if (committed && prepared.kind == MutationKind::authoritative) {
-        committed = transactions::commit_authoritative(state, record, prepared);
+        CommittedClientState after{};
+        committed = transactions::commit_authoritative(state, record, prepared, after);
+        if (committed && clientState != nullptr) {
+            *clientState = after;
+        }
     } else if (committed && prepared.kind == MutationKind::refresh) {
         committed = commit_refresh(record, prepared);
+    } else if (committed && prepared.kind == MutationKind::republish) {
+        committed = commit_republish(state, record, prepared);
     } else if (committed && prepared.kind == MutationKind::acknowledgement) {
         committed = commit_acknowledgement(state, record, prepared);
     } else {

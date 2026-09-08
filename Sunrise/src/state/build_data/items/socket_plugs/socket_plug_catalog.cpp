@@ -2,14 +2,16 @@
 
 #include <algorithm>
 #include <bitset>
+#include <shared_mutex>
 
 #include "../../table.h"
 #include "../details/item_detail_catalog.h"
+#include "core/threading/srw_lock.h"
 
 namespace sunrise::state::build_data::items::socket_plugs {
 namespace {
 
-Lock g_lock;
+core::threading::SrwLock g_lock;
 Table<Rule, kRuleCapacity> g_rules;
 Table<Pool, kPoolCapacity> g_pools;
 Table<Member, kMemberCapacity> g_members;
@@ -25,7 +27,7 @@ std::bitset<details::kDefinitionCapacity> g_membership;
 
 /** Clears the complete socket-plug catalog under one exclusive hold. */
 void clear() noexcept {
-    const Lock::Exclusive guard(g_lock);
+    const std::lock_guard guard(g_lock);
     g_rules.clear();
     g_pools.clear();
     g_members.clear();
@@ -82,9 +84,7 @@ bool replace(std::span<const Rule> rules,
 
     // Fixed/native plugs (notably Exotic armor intrinsics) are often authored only as a
     // socket's initial plug and never appear in a selectable pool. The editor's unrestricted
-    // socket path must still be allowed to install those definitions. Add every configured
-    // native initial plug to the global-valid membership set while leaving allowed() unchanged;
-    // normal authored compatibility therefore stays exact.
+    // socket path must still be allowed to install those definitions.
     for (std::size_t definitionIndex = 0; definitionIndex < details::kDefinitionCapacity;
          ++definitionIndex) {
         details::Definition detail{};
@@ -92,7 +92,6 @@ bool replace(std::span<const Rule> rules,
             || detail.ordinarySocketState != details::OrdinarySocketState::present) {
             continue;
         }
-
         for (std::size_t lane = 0; lane < detail.ordinarySocketCount; ++lane) {
             const std::uint16_t initial = detail.initialPlugIndices[lane];
             if (initial != details::kUnavailableItemIndex && initial < membership.size()) {
@@ -100,7 +99,7 @@ bool replace(std::span<const Rule> rules,
             }
         }
     }
-    const Lock::Exclusive guard(g_lock);
+    const std::lock_guard guard(g_lock);
     if (!g_rules.replace(rules) || !g_pools.replace(pools) || !g_members.replace(members)) {
         return false;
     }
@@ -115,7 +114,7 @@ bool allowed(std::uint16_t itemDefinitionIndex,
     if (lane >= kLaneCapacity) {
         return false;
     }
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     const auto rules = g_rules.rows();
     const auto pools = g_pools.rows();
     const auto members = g_members.rows();
@@ -134,12 +133,43 @@ bool allowed(std::uint16_t itemDefinitionIndex,
     return std::binary_search(range.begin(), range.end(), plugDefinitionIndex);
 }
 
+/** Walks the members of one lane's pool under a shared hold. */
+bool visit_pool(std::uint16_t itemDefinitionIndex,
+                std::uint8_t lane,
+                MemberVisitor visitor,
+                void* context) noexcept {
+    if (lane >= kLaneCapacity || visitor == nullptr) {
+        return false;
+    }
+    const std::shared_lock guard(g_lock);
+    const auto rules = g_rules.rows();
+    const auto pools = g_pools.rows();
+    const auto members = g_members.rows();
+    const Rule key{itemDefinitionIndex, lane, 0, 0};
+    const auto found = std::lower_bound(rules.begin(), rules.end(), key, rule_less);
+    if (found == rules.end() || found->itemDefinitionIndex != itemDefinitionIndex
+        || found->lane != lane || found->poolIndex >= pools.size()) {
+        return false;
+    }
+    const Pool& pool = pools[found->poolIndex];
+    if (pool.memberOffset > members.size()
+        || pool.memberCount > members.size() - pool.memberOffset) {
+        return false;
+    }
+    for (const Member member : members.subspan(pool.memberOffset, pool.memberCount)) {
+        if (!visitor(context, member)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * Answers whether one definition is a valid ordinary-socket plug for editor/runtime use.
  * This includes selectable pool members plus fixed native initial plugs.
  */
 bool contains(Member plugDefinitionIndex) noexcept {
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     return plugDefinitionIndex < g_membership.size() && g_membership.test(plugDefinitionIndex);
 }
 
@@ -153,14 +183,14 @@ bool snapshot(std::span<Rule> rules,
     ruleCount = 0;
     poolCount = 0;
     memberCount = 0;
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     return g_rules.snapshot(rules, ruleCount) && g_pools.snapshot(pools, poolCount)
            && g_members.snapshot(members, memberCount);
 }
 
 /** Reports the published rule count under the catalog lock. */
 std::size_t rule_count() noexcept {
-    const Lock::Shared guard(g_lock);
+    const std::shared_lock guard(g_lock);
     return g_rules.count();
 }
 

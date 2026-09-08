@@ -9,6 +9,41 @@ namespace sunrise::core::settings::parser {
 /** @param input Complete JSON text, borrowed and never changed. */
 Parser::Parser(std::string_view input) noexcept : input_(input) {}
 
+/** Reads the version without interpreting settings from an older schema. */
+bool Parser::parse_version(std::uint32_t& output) noexcept {
+    output = 0;
+    if (!consume('{')) {
+        return false;
+    }
+    if (consume('}')) {
+        return at_end();
+    }
+    bool found = false;
+    for (;;) {
+        std::string_view key;
+        if (!string(key) || !consume(':')) {
+            return false;
+        }
+        if (key == "version") {
+            std::uint64_t value = 0;
+            if (found || !unsigned_integer(value)
+                || value > (std::numeric_limits<std::uint32_t>::max)()) {
+                return false;
+            }
+            output = static_cast<std::uint32_t>(value);
+            found = true;
+        } else if (!skip_value(0)) {
+            return false;
+        }
+        if (consume('}')) {
+            return at_end();
+        }
+        if (!consume(',')) {
+            return false;
+        }
+    }
+}
+
 /** Parses the supported root object and skips unknown top-level values. */
 bool Parser::parse_root(Settings& output) noexcept {
     if (!consume('{')) {
@@ -36,6 +71,10 @@ bool Parser::parse_root(Settings& output) noexcept {
             }
             output.version = static_cast<std::uint32_t>(value);
             hasVersion = true;
+        } else if (key == "complete_exotic_catalysts") {
+            if (!boolean(output.completeExoticCatalysts)) {
+                return false;
+            }
         } else if (key == "core") {
             if (hasCore || !core(output)) {
                 return false;
@@ -82,6 +121,7 @@ bool Parser::core(Settings& output) noexcept {
         return true;
     }
     bool hasLogging = false;
+    bool hasActivitySdkGeneration = false;
     for (;;) {
         std::string_view key;
         if (!string(key) || !consume(':')) {
@@ -92,10 +132,50 @@ bool Parser::core(Settings& output) noexcept {
                 return false;
             }
             hasLogging = true;
+        } else if (key == "activity_sdk_generation") {
+            if (hasActivitySdkGeneration
+                || !activity_sdk_generation_settings(output.activitySdkGeneration)) {
+                return false;
+            }
+            hasActivitySdkGeneration = true;
         } else if (!skip_value(0)) {
             return false;
         }
         if (consume('}')) {
+            return true;
+        }
+        if (!consume(',')) {
+            return false;
+        }
+    }
+}
+
+/** Parses the activity SDK generation block. Omitted or unknown members keep the defaults. */
+bool Parser::activity_sdk_generation_settings(ActivitySdkGenerationSettings& output) noexcept {
+    if (!consume('{')) {
+        return false;
+    }
+    ActivitySdkGenerationSettings candidate{};
+    if (consume('}')) {
+        output = candidate;
+        return true;
+    }
+    bool hasLuaDeclarations = false;
+    for (;;) {
+        std::string_view key;
+        if (!string(key) || !consume(':')) {
+            return false;
+        }
+        if (key == "lua_declarations") {
+            if (hasLuaDeclarations || !boolean(candidate.luaDeclarations)) {
+                return false;
+            }
+            hasLuaDeclarations = true;
+        } else if (!skip_value(0)) {
+            return false;
+        }
+        if (consume('}')) {
+            output = candidate;
             return true;
         }
         if (!consume(',')) {
@@ -183,8 +263,10 @@ Settings defaults() noexcept {
     // Named members, so adding one to Settings cannot silently shift the rest.
     return Settings{
         .version = kSettingsVersion,
+        .completeExoticCatalysts = true,
         .logging = log::defaults(),
-        .server = server::Settings{state::entitlements::authored()},
+        .activitySdkGeneration = {},
+        .server = server::Settings{},
         .initialActivityDefaults = state::activity::defaults::authored(),
     };
 }

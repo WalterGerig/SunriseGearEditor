@@ -39,12 +39,17 @@ constexpr SHORT kKeyHeldBit = static_cast<SHORT>(0x8000);
 constexpr std::uint16_t kJumpAction =
     static_cast<std::uint16_t>(state::account::settings::bindings::Action::jump);
 
+/** Milliseconds a read binding is trusted before the account is copied again. */
+constexpr std::uint64_t kBindingRereadMs = 5000;
+
 /** Jump held on the previous tick, so the flag is only cleared on the press and not on the hold. */
 bool g_jumpHeld{false};
 /** Both halves of the jump binding. An unbound half stays empty. */
 std::array<std::optional<std::uint16_t>, 2> g_jumpBinding{};
-/** Set once the binding is read, so the costly account snapshot runs once. */
+/** Set once the binding is read; the costly account snapshot then runs once per interval. */
 bool g_bindingRead{false};
+/** Tick of the last read, so a rebinding during the run is picked up. */
+std::uint64_t g_bindingReadTick{};
 
 /**
  * Reads one value out of game memory without faulting on a torn pointer.
@@ -71,21 +76,23 @@ bool g_bindingRead{false};
 }
 
 /**
- * Takes the account's jump binding once it is loaded.
- * @return True when the binding has been read, whether or not either half is bound.
+ * Takes the account's jump binding once it is loaded, and again once per interval.
+ * @return True when a binding has been read, whether or not either half is bound.
  */
 [[nodiscard]] bool read_jump_binding() noexcept {
-    if (g_bindingRead) {
+    const std::uint64_t now = GetTickCount64();
+    if (g_bindingRead && now < g_bindingReadTick + kBindingRereadMs) {
         return true;
     }
-    // The snapshot copies the whole account, so it stops once the bindings arrive.
+    // The snapshot copies the whole account, so it runs once per interval, not per tick.
     const state::AccountState account = state::account_snapshot();
     if (!account.settings.keyBindings.configured) {
-        return false;
+        return g_bindingRead;
     }
     const auto& binding = account.settings.keyBindings.values[kJumpAction];
     g_jumpBinding = {binding.primary, binding.secondary};
     g_bindingRead = true;
+    g_bindingReadTick = now;
     return true;
 }
 

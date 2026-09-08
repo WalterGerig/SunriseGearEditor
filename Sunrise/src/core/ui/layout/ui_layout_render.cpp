@@ -8,6 +8,7 @@
 #include "../components/card/ui_card_component.h"
 #include "../components/logo/ui_logo_component.h"
 #include "../components/section/ui_section_component.h"
+#include "../modules/registry/ui_module_registry.h"
 #include "../scaling/dpi/ui_dpi_scaling.h"
 #include "navigation/ui_layout_navigation.h"
 #include "ui_layout_lifecycle.h"
@@ -44,6 +45,10 @@ constexpr ImGuiID kSurfaceAnimationId = 1;
 constexpr animation::transition::Rates kVisibilityRates{16.0F, 14.0F};
 /** A closed surface has finished its transition and draws nothing. */
 constexpr float kClosedProgress = 0.0F;
+/** The surface grows from this fraction of its size while it opens. */
+constexpr float kOpeningScale = 0.96F;
+/** Full size, reached when the surface is fully open. */
+constexpr float kOpenScale = 1.0F;
 /** 34 authored pixels give the title logo presence without crowding the title row. */
 constexpr float kTitleLogoExtent = 34.0F;
 /** The title is drawn at this multiple of the body text, so it holds the logo's row. */
@@ -102,6 +107,17 @@ void draw_content(const navigation::Selection& selected) noexcept {
     selected.descriptor.frame_callback()();
 }
 
+/** Draws optional module-owned companion windows after the main surface. */
+void draw_companion_windows() noexcept {
+    const modules::registry::RegistrySnapshot registrySnapshot = modules::registry::snapshot();
+    for (const modules::Descriptor& descriptor : registrySnapshot.entries()) {
+        const modules::FrameCallback callback = descriptor.companion_frame_callback();
+        if (callback != nullptr) {
+            callback();
+        }
+    }
+}
+
 /** Draws the animated logo, then the name and version, on one title row. */
 void draw_title() noexcept {
     const float extent = scaling::dpi::pixels(kTitleLogoExtent);
@@ -154,13 +170,19 @@ bool render(bool visible) noexcept {
         return false;
     }
 
-    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Always, kCenterPivot);
-
-    // Set the authored size only when the window is created. After that Dear ImGui owns the size,
-    // so the bottom-right resize grip can be dragged without the next frame snapping it back.
-    ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
-
-    // Keep manual resizing inside the active game viewport and preserve the existing layout minimums.
+    const float scale = kOpeningScale + ((kOpenScale - kOpeningScale) * progress);
+    const ImVec2 center = viewport->GetCenter();
+    if (visible && progress < 1.0F) {
+        // The opening zoom grows around the viewport centre. Only the settled window is movable.
+        ImGui::SetNextWindowPos(center, ImGuiCond_Always, kCenterPivot);
+        ImGui::SetNextWindowSize({size.x * scale, size.y * scale}, ImGuiCond_Always);
+    } else {
+        const ImVec2 centeredPosition{center.x - (size.x * kCenterPivot.x),
+                                      center.y - (size.y * kCenterPivot.y)};
+        ImGui::SetNextWindowPos(centeredPosition, ImGuiCond_FirstUseEver);
+        // Once open, Dear ImGui owns the size so the Gear Editor can be resized manually.
+        ImGui::SetNextWindowSize(size, ImGuiCond_FirstUseEver);
+    }
     const float margin = scaling::dpi::pixels(kViewportMargin);
     const ImVec2 minimumSize{scaling::dpi::pixels(kMinimumWindowWidth),
                              scaling::dpi::pixels(kMinimumWindowHeight)};
@@ -194,6 +216,7 @@ bool render(bool visible) noexcept {
         }
     }
     ImGui::End();
+    draw_companion_windows();
     ImGui::PopStyleVar();
     return true;
 }

@@ -19,12 +19,16 @@ jobs:
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
 
+      # The x86-hosted compiler runs out of heap on the large static tables. Force the x64 host.
       - name: Build
         run: >
           msbuild Sunrise.sln /m
           /p:Configuration=Release
           /p:Platform=x64
+          /p:PreferredToolArchitecture=x64
           /verbosity:minimal
 
       - name: Upload artifact

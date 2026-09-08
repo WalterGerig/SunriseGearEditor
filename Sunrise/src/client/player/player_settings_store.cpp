@@ -70,6 +70,7 @@ void boolean_for(std::string_view text, std::string_view key, bool& output) noex
  */
 void parse(std::string_view text, Settings& output) noexcept {
     boolean_for(text, "\"infinite_ammo_enabled\"", output.infiniteAmmoEnabled);
+    boolean_for(text, "\"anti_afk_enabled\"", output.antiAfkEnabled);
 }
 
 /**
@@ -85,9 +86,11 @@ void parse(std::string_view text, Settings& output) noexcept {
     std::array<char, kFileCapacity> document{};
     const int size = std::snprintf(document.data(),
                                    document.size(),
-                                   "{\n  \"infinite_ammo_enabled\": %s\n}\n",
-                                   settings.infiniteAmmoEnabled ? "true" : "false");
-    if (size <= 0) {
+                                   "{\n  \"infinite_ammo_enabled\": %s,\n"
+                                   "  \"anti_afk_enabled\": %s\n}\n",
+                                   settings.infiniteAmmoEnabled ? "true" : "false",
+                                   settings.antiAfkEnabled ? "true" : "false");
+    if (size <= 0 || static_cast<std::size_t>(size) >= document.size()) {
         return false;
     }
     const HANDLE file = CreateFileW(g_path.chars.data(),
